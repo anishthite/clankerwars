@@ -1,10 +1,10 @@
 <!DOCTYPE html>
 <html lang="en">
 	<head>
-		<title>Toys</title>
+		<title>Clanker Wars</title>
 		<meta charset="utf-8">
 		<meta name="viewport" content="width=device-width, initial-scale=1, user-scalable=no">
-		<link rel="icon" href="data:image/svg+xml,<svg xmlns=%22http://www.w3.org/2000/svg%22 viewBox=%220 0 100 100%22><text y=%22.9em%22 font-size=%2290%22>🧸</text></svg>">
+		<link rel="icon" href="data:image/svg+xml,<svg xmlns=%22http://www.w3.org/2000/svg%22 viewBox=%220 0 100 100%22><text y=%22.9em%22 font-size=%2290%22>🤖</text></svg>">
 		<style>
 
 			* { box-sizing: border-box; }
@@ -34,6 +34,7 @@
 				border-radius: 999px;
 				padding: 4px;
 				box-shadow: 0 2px 12px rgba(90, 60, 20, 0.15);
+				z-index: 5;
 			}
 
 			#modebar button {
@@ -46,6 +47,8 @@
 
 			#modebar button.active { background: #8a5a33; color: #fff8ee; }
 
+			#modebar #battleBtn.active { background: #a04d33; }
+
 			#palette {
 				position: fixed;
 				left: 16px;
@@ -53,14 +56,30 @@
 				transform: translateY(-50%);
 				display: flex;
 				flex-direction: column;
-				gap: 10px;
+				gap: 8px;
 				transition: opacity 0.25s, transform 0.25s;
+				max-height: calc(100vh - 120px);
+				overflow-y: auto;
+				scrollbar-width: none;
+				padding: 4px;
 			}
 
-			body.play #palette {
+			#palette::-webkit-scrollbar { display: none; }
+
+			body.battle #palette {
 				opacity: 0;
 				pointer-events: none;
 				transform: translate(-16px, -50%);
+			}
+
+			.palette-label {
+				font-size: 10px;
+				font-weight: 700;
+				letter-spacing: 0.1em;
+				text-transform: uppercase;
+				color: #b7a888;
+				text-align: center;
+				margin-top: 4px;
 			}
 
 			.piece-btn {
@@ -79,6 +98,7 @@
 				color: #7a6248;
 				font-size: 11px;
 				font-weight: 600;
+				flex-shrink: 0;
 			}
 
 			.piece-btn:hover { transform: scale(1.06); }
@@ -92,7 +112,9 @@
 				pointer-events: none;
 			}
 
-			#toys {
+			.piece-btn.weapon svg { fill: #b9bfc7; stroke: #5c636e; }
+
+			#robots {
 				position: fixed;
 				right: 16px;
 				top: 50%;
@@ -100,16 +122,22 @@
 				display: flex;
 				flex-direction: column;
 				gap: 8px;
-				width: 120px;
+				width: 148px;
 				transition: opacity 0.25s, transform 0.25s;
+				max-height: calc(100vh - 120px);
+				overflow-y: auto;
+				scrollbar-width: none;
+				padding: 4px;
 			}
 
-			.toy-btn {
+			#robots::-webkit-scrollbar { display: none; }
+
+			.bot-btn {
 				display: flex;
 				justify-content: space-between;
 				align-items: center;
-				gap: 8px;
-				padding: 9px 14px;
+				gap: 6px;
+				padding: 9px 12px;
 				border-radius: 12px;
 				background: #fffdf8;
 				color: #7a6248;
@@ -117,21 +145,25 @@
 				font-size: 12px;
 				text-align: left;
 				box-shadow: 0 2px 10px rgba(90, 60, 20, 0.12);
+				flex-shrink: 0;
 			}
 
-			.toy-del { opacity: 0.4; }
-			.toy-del:hover { opacity: 1; color: #a04d33; }
+			.bot-del { opacity: 0.4; }
+			.bot-del:hover { opacity: 1; color: #a04d33; }
 
-			.toy-label { flex: 1; }
+			.bot-label { flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 
-			.toy-eye { opacity: 0.55; }
-			.toy-eye:hover { opacity: 1; }
+			.bot-sub { display: block; font-size: 10px; font-weight: 500; opacity: 0.65; }
 
-			.toy-btn.active .toy-del:hover { color: #ffd9c4; }
+			.bot-flag { opacity: 0.75; }
+			.bot-flag.off { opacity: 0.25; filter: grayscale(1); }
+			.bot-flag:hover { opacity: 1; }
 
-			.toy-btn.active { background: #8a5a33; color: #fff8ee; }
+			.bot-btn.active { background: #8a5a33; color: #fff8ee; }
 
-			.toy-btn.new {
+			.bot-btn.active .bot-del:hover { color: #ffd9c4; }
+
+			.bot-btn.new {
 				background: transparent;
 				border: 2px dashed #d8c9ab;
 				color: #f2e7d3;
@@ -140,7 +172,7 @@
 
 			#toolbar {
 				position: fixed;
-				bottom: 52px;
+				bottom: 100px;
 				left: 50%;
 				transform: translateX(-50%);
 				display: flex;
@@ -165,12 +197,49 @@
 
 			#toolbar #deleteBtn { background: #f6e0d8; color: #a04d33; }
 
+			#botbar {
+				position: fixed;
+				bottom: 48px;
+				left: 50%;
+				transform: translateX(-50%);
+				display: flex;
+				align-items: center;
+				gap: 8px;
+				background: #fffdf8;
+				padding: 6px 8px;
+				border-radius: 999px;
+				box-shadow: 0 2px 12px rgba(90, 60, 20, 0.15);
+				font-size: 12px;
+				color: #7a6248;
+				transition: opacity 0.25s;
+				white-space: nowrap;
+			}
+
+			body.battle #botbar { opacity: 0; pointer-events: none; }
+
+			#botbar button, #botbar select {
+				background: #f4e9da;
+				color: #6d4a26;
+				font-weight: 600;
+				font-size: 12px;
+				font-family: inherit;
+				border: none;
+				border-radius: 999px;
+				padding: 5px 12px;
+				cursor: pointer;
+			}
+
+			#botbar button:hover, #botbar select:hover { background: #ecdcc4; }
+
+			#botWeight { font-weight: 600; padding: 0 4px; }
+
 			#actions {
 				position: fixed;
 				top: 20px;
 				right: 16px;
 				display: flex;
 				gap: 8px;
+				z-index: 5;
 			}
 
 			#actions button {
@@ -182,21 +251,140 @@
 				box-shadow: 0 2px 10px rgba(90, 60, 20, 0.12);
 			}
 
-			#resetBtn {
+			#hud {
+				position: fixed;
+				top: 72px;
+				left: 16px;
 				display: none;
+				flex-direction: column;
+				gap: 8px;
+				width: 190px;
+				z-index: 4;
+			}
+
+			body.battle #hud { display: flex; }
+
+			.hud-card {
+				background: #fffdf8;
+				border-radius: 12px;
+				border-left: 5px solid var(--c, #a04d33);
+				padding: 8px 10px;
+				box-shadow: 0 2px 10px rgba(90, 60, 20, 0.12);
+				cursor: pointer;
+			}
+
+			.hud-card.dead { opacity: 0.55; filter: grayscale(0.7); }
+
+			.hud-name {
+				font-size: 12px;
+				font-weight: 700;
+				color: #5c4a33;
+				white-space: nowrap;
+				overflow: hidden;
+				text-overflow: ellipsis;
+			}
+
+			.hud-bar {
+				height: 7px;
+				margin-top: 5px;
+				background: #eee2cd;
+				border-radius: 99px;
+				overflow: hidden;
+			}
+
+			.hud-fill {
+				height: 100%;
+				width: 100%;
+				border-radius: 99px;
+				background: linear-gradient(90deg, #d95f43, #e6a23c 45%, #59b87c 90%);
+				background-size: 190px 100%;
+				transition: width 0.2s;
+			}
+
+			.hud-status {
+				margin-top: 4px;
+				font-size: 10px;
+				font-weight: 700;
+				color: #a04d33;
+				min-height: 12px;
+				letter-spacing: 0.03em;
+			}
+
+			#battlebar {
 				position: fixed;
 				bottom: 52px;
 				left: 50%;
 				transform: translateX(-50%);
-				padding: 8px 20px;
-				border-radius: 999px;
+				display: none;
+				align-items: center;
+				gap: 10px;
 				background: #fffdf8;
-				color: #7a6248;
-				font-weight: 600;
+				padding: 6px 8px 6px 16px;
+				border-radius: 999px;
 				box-shadow: 0 2px 12px rgba(90, 60, 20, 0.15);
 			}
 
-			body.play #resetBtn { display: block; }
+			body.battle #battlebar { display: flex; }
+
+			#battleTime {
+				font-weight: 700;
+				color: #5c4a33;
+				font-variant-numeric: tabular-nums;
+				min-width: 44px;
+			}
+
+			#battleSeed {
+				font-size: 11px;
+				font-weight: 600;
+				color: #a3906f;
+				background: none;
+				padding: 4px 6px;
+			}
+
+			#battleSeed:hover { color: #6d4a26; }
+
+			#battlebar .bar-btn {
+				padding: 7px 16px;
+				border-radius: 999px;
+				background: #f4e9da;
+				color: #6d4a26;
+				font-weight: 600;
+			}
+
+			#battlebar .bar-btn:hover { background: #ecdcc4; }
+
+			#battlebar #rematchBtn { background: #a04d33; color: #fff8ee; }
+
+			#battlebar #recBtn.recording { background: #a04d33; color: #fff8ee; }
+
+			#banner {
+				position: fixed;
+				top: 34%;
+				left: 50%;
+				transform: translate(-50%, -50%);
+				text-align: center;
+				pointer-events: none;
+				z-index: 8;
+			}
+
+			#banner[hidden] { display: none; }
+
+			#bannerTitle {
+				margin: 0;
+				font-size: clamp(34px, 7vw, 64px);
+				font-weight: 800;
+				color: #fff8ee;
+				letter-spacing: 0.02em;
+				text-shadow: 0 4px 24px rgba(60, 30, 5, 0.55), 0 2px 0 #a04d33;
+			}
+
+			#bannerSub {
+				margin: 6px 0 0;
+				font-size: 15px;
+				font-weight: 700;
+				color: #fff3df;
+				text-shadow: 0 2px 12px rgba(60, 30, 5, 0.6);
+			}
 
 			#hint {
 				position: fixed;
@@ -234,9 +422,10 @@
 				padding: 7px 14px;
 				border-radius: 999px;
 				box-shadow: 0 2px 12px rgba(90, 60, 20, 0.15);
+				z-index: 6;
 			}
 
-			#shareModal {
+			.modal {
 				position: fixed;
 				inset: 0;
 				background: rgba(60, 42, 20, 0.45);
@@ -246,9 +435,9 @@
 				z-index: 20;
 			}
 
-			#shareModal[hidden] { display: none; }
+			.modal[hidden] { display: none; }
 
-			#shareCard {
+			.modal-card {
 				background: #fffdf8;
 				border-radius: 18px;
 				padding: 16px;
@@ -296,9 +485,9 @@
 				padding: 8px 14px;
 			}
 
-			#shareActions { display: flex; gap: 8px; justify-content: flex-end; }
+			.modal-actions { display: flex; gap: 8px; justify-content: flex-end; flex-wrap: wrap; }
 
-			#copyLinkBtn, #downloadBtn, #closeShareBtn {
+			.btn-primary, .btn-plain, #downloadBtn {
 				padding: 8px 16px;
 				border-radius: 999px;
 				background: #8a5a33;
@@ -312,7 +501,131 @@
 				cursor: pointer;
 			}
 
-			#closeShareBtn { background: #f4e9da; color: #6d4a26; }
+			.btn-plain { background: #f4e9da; color: #6d4a26; }
+
+			#commTabs { display: flex; gap: 6px; }
+
+			#commTabs button {
+				flex: 1;
+				padding: 7px 0;
+				border-radius: 999px;
+				background: #f4e9da;
+				color: #6d4a26;
+				font-weight: 600;
+				font-size: 12px;
+			}
+
+			#commTabs button.active { background: #8a5a33; color: #fff8ee; }
+
+			#commList {
+				display: flex;
+				flex-direction: column;
+				gap: 6px;
+				max-height: 46vh;
+				overflow-y: auto;
+			}
+
+			.comm-row {
+				display: flex;
+				align-items: center;
+				gap: 10px;
+				background: #f9f2e6;
+				border-radius: 12px;
+				padding: 8px 12px;
+			}
+
+			.comm-info { flex: 1; min-width: 0; }
+
+			.comm-name {
+				font-size: 13px;
+				font-weight: 700;
+				color: #5c4a33;
+				white-space: nowrap;
+				overflow: hidden;
+				text-overflow: ellipsis;
+			}
+
+			.comm-meta { font-size: 11px; color: #a3906f; font-weight: 600; }
+
+			.comm-row button {
+				padding: 6px 12px;
+				border-radius: 999px;
+				background: #8a5a33;
+				color: #fff8ee;
+				font-weight: 600;
+				font-size: 12px;
+			}
+
+			.comm-row button.danger { background: #f6e0d8; color: #a04d33; }
+
+			#commStatus {
+				font-size: 12px;
+				color: #a3906f;
+				font-weight: 600;
+				text-align: center;
+				min-height: 15px;
+			}
+
+			#splash {
+				position: fixed;
+				inset: 0;
+				background: rgba(58, 40, 18, 0.55);
+				backdrop-filter: blur(3px);
+				display: flex;
+				align-items: center;
+				justify-content: center;
+				z-index: 25;
+			}
+
+			#splash[hidden] { display: none; }
+
+			#splashCard {
+				background: #fffdf8;
+				border-radius: 24px;
+				padding: 36px 40px;
+				text-align: center;
+				box-shadow: 0 16px 60px rgba(50, 30, 8, 0.45);
+				width: min(440px, calc(100vw - 40px));
+			}
+
+			#splashCard h1 {
+				margin: 0;
+				font-size: 38px;
+				font-weight: 800;
+				color: #8a5a33;
+				letter-spacing: 0.01em;
+			}
+
+			#splashCard p {
+				margin: 10px 0 24px;
+				color: #a3906f;
+				font-size: 14px;
+				font-weight: 600;
+				line-height: 1.5;
+			}
+
+			#splashCard .stack { display: flex; flex-direction: column; gap: 10px; }
+
+			#watchBtn {
+				padding: 14px 20px;
+				border-radius: 999px;
+				background: #a04d33;
+				color: #fff8ee;
+				font-weight: 700;
+				font-size: 16px;
+				box-shadow: 0 4px 16px rgba(160, 77, 51, 0.4);
+			}
+
+			#watchBtn:hover { transform: scale(1.02); }
+
+			#buildOwnBtn {
+				padding: 12px 20px;
+				border-radius: 999px;
+				background: #f4e9da;
+				color: #6d4a26;
+				font-weight: 600;
+				font-size: 14px;
+			}
 
 			#loading {
 				position: fixed;
@@ -324,15 +637,18 @@
 				color: #8a5a33;
 				font-size: 15px;
 				font-weight: 600;
-				z-index: 10;
+				z-index: 30;
 			}
 
 			@media (max-width: 700px) {
 
-				.piece-btn { width: 60px; padding: 6px 4px 5px; font-size: 10px; }
-				.piece-btn svg { width: 30px; height: 30px; }
-				#toys { width: 100px; }
+				.piece-btn { width: 58px; padding: 6px 4px 5px; font-size: 10px; }
+				.piece-btn svg { width: 28px; height: 28px; }
+				#robots { width: 116px; }
+				#hud { width: 148px; top: 64px; }
 				#hint { white-space: normal; max-width: 55vw; }
+				#botbar { bottom: 64px; }
+				#toolbar { bottom: 116px; }
 
 			}
 
@@ -352,39 +668,83 @@
 	<body>
 		<div id="modebar">
 			<button id="buildBtn" class="active">Build</button>
-			<button id="playBtn">Play</button>
+			<button id="battleBtn">Battle</button>
 		</div>
 		<div id="palette"></div>
-		<div id="toys"></div>
+		<div id="robots"></div>
 		<div id="toolbar" hidden>
 			<button id="spinBtn"></button>
+			<button id="armorBtn"></button>
 			<button id="duplicateBtn">Duplicate</button>
 			<button id="deleteBtn">Delete</button>
 		</div>
+		<div id="botbar">
+			<button id="botNameBtn"></button>
+			<span id="botWeight"></span>
+			<select id="botAiSelect" title="Driving style"></select>
+		</div>
 		<div id="actions">
+			<button id="communityBtn">Community</button>
 			<button id="shareBtn">Share</button>
 		</div>
-		<button id="resetBtn">Reset</button>
+		<div id="hud"></div>
+		<div id="battlebar">
+			<span id="battleTime">1:30</span>
+			<button id="battleSeed" title="New seed">seed 0 ↻</button>
+			<button id="recBtn" class="bar-btn" title="Record a clip">● Rec</button>
+			<button id="rematchBtn" class="bar-btn">Rematch</button>
+			<button id="editBtn" class="bar-btn">Build</button>
+		</div>
+		<div id="banner" hidden>
+			<h2 id="bannerTitle"></h2>
+			<p id="bannerSub"></p>
+		</div>
 		<div id="hint"></div>
-		<a id="github" href="https://github.com/mrdoob/toys" target="_blank" rel="noopener">GitHub</a>
+		<a id="github" href="https://github.com/mrdoob/toys" target="_blank" rel="noopener">based on mrdoob/toys</a>
 		<div id="recBadge" hidden>● recording…</div>
-		<div id="shareModal" hidden>
-			<div id="shareCard">
+		<div id="shareModal" class="modal" hidden>
+			<div id="shareCard" class="modal-card">
 				<div id="shareStage" hidden>
 					<video id="shareVideo" controls autoplay muted loop playsinline></video>
-					<a id="downloadBtn" download="toy.mp4">Download video</a>
+					<a id="downloadBtn" download="clanker-wars.mp4">Download video</a>
 				</div>
 				<label id="shareLinkLabel" for="shareLink">Share link</label>
 				<div id="shareLinkRow">
 					<input id="shareLink" readonly>
-					<button id="copyLinkBtn">Copy</button>
+					<button id="copyLinkBtn" class="btn-primary">Copy</button>
 				</div>
-				<div id="shareActions">
-					<button id="closeShareBtn">Close</button>
+				<div class="modal-actions">
+					<button id="closeShareBtn" class="btn-plain">Close</button>
 				</div>
 			</div>
 		</div>
-		<div id="loading">building the workshop…</div>
+		<div id="communityModal" class="modal" hidden>
+			<div class="modal-card">
+				<div id="commTabs">
+					<button data-tab="top" class="active">Arena picks</button>
+					<button data-tab="new">Newest</button>
+					<button data-tab="mine">My published</button>
+				</div>
+				<div id="commList"></div>
+				<div id="commStatus"></div>
+				<div class="modal-actions">
+					<button id="samplesBtn" class="btn-plain">Load sample bots</button>
+					<button id="publishBtn" class="btn-primary">Publish current bot</button>
+					<button id="closeCommunityBtn" class="btn-plain">Close</button>
+				</div>
+			</div>
+		</div>
+		<div id="splash" hidden>
+			<div id="splashCard">
+				<h1>🤖 CLANKER WARS</h1>
+				<p>build wacky battle bots from wood and steel,<br>pick their armour and weapons — then let them fight.</p>
+				<div class="stack">
+					<button id="watchBtn">▶ See sample bots fight</button>
+					<button id="buildOwnBtn">🔧 Build your own</button>
+				</div>
+			</div>
+		</div>
+		<div id="loading">assembling the arena…</div>
 		<script type="module" src="main.js"></script>
 	</body>
 </html>

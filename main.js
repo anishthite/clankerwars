@@ -4,24 +4,66 @@ import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
 import { RoomEnvironment } from 'three/addons/environments/RoomEnvironment.js';
 import { RoundedBoxGeometry } from 'three/addons/geometries/RoundedBoxGeometry.js';
 import { WoodNodeMaterial } from 'three/addons/materials/WoodNodeMaterial.js';
+import * as BufferGeometryUtils from 'three/addons/utils/BufferGeometryUtils.js';
 import { ao } from 'three/addons/tsl/display/GTAONode.js';
 import { fxaa } from 'three/addons/tsl/display/FXAANode.js';
 import Box3D from 'box3d.js/inline';
 import { createMP4 } from './mp4.js';
+import { makeSamples } from './samples.js';
 
-const SPIN_SPEED = 8; // rad/s
-const MOTOR_TORQUE = 300;
+const SPIN_SPEED = 13; // rad/s — a 1.7 m bar swings its tips at ~11 m/s
+const MOTOR_TORQUE = 220;
 const DENSITY = 100;
 const GRID_SNAP = 0.1;
 const SIZE_SNAP = 0.05;
 const TIME_STEP = 1 / 60;
-const TOY_GAP = 0.8; // spacing between toys in play mode
-const STORAGE_KEY = 'toys';
+const STORAGE_KEY = 'rw-garage';
 const REC_FPS = 60;
-const REC_FRAMES = REC_FPS * 5; // five seconds of play
+const REC_MAX_FRAMES = REC_FPS * 60; // record as long as you like, up to a minute
+
+// battle tuning
+
+const ARENA_APOTHEM = 6; // octagon wall distance from centre
+const ARENA_OUT = 6.9; // beyond this you are out of the arena
+const WALL_HEIGHT = 0.85;
+const BATTLE_TIME = 90; // seconds until the judges decide
+const COUNT_OUT = 12; // seconds of stillness before you are counted out
+const KO_DAMAGE = 0.72; // fraction of total hp that ends a bot
+const DRIVE = 12; // drive force per kg — the solver's static grip pins
+// anything pushed with much less than its own weight, so thrust scales
+// with mass and the weight penalty lives in the top-speed cap instead
+const DMG_MIN_SPEED = 1.6; // m/s of approach before a hit hurts
+const FIRE_DPS = 0.05; // fraction of a piece's max hp burned per second
 
 const Y_AXIS = new THREE.Vector3( 0, 1, 0 );
 const Z_AXIS = new THREE.Vector3( 0, 0, 1 );
+
+// a tiny seeded rng — every battle replays the same from the same seed
+
+function mulberry32( seed ) {
+
+	let a = seed >>> 0;
+
+	return function () {
+
+		a |= 0; a = ( a + 0x6D2B79F5 ) | 0;
+		let t = Math.imul( a ^ ( a >>> 15 ), 1 | a );
+		t = ( t + Math.imul( t ^ ( t >>> 7 ), 61 | t ) ) ^ t;
+		return ( ( t ^ ( t >>> 14 ) ) >>> 0 ) / 4294967296;
+
+	};
+
+}
+
+// armour decides how heavy, how tough and how hard-hitting a piece is
+
+const ARMORS = {
+	wood: { name: 'Wood', density: 1.0, hp: 1.0, dmg: 1.0, flammable: true },
+	steel: { name: 'Steel', density: 2.2, hp: 2.4, dmg: 1.35, flammable: false },
+	titanium: { name: 'Titanium', density: 3.4, hp: 4.2, dmg: 1.6, flammable: false }
+};
+
+const ARMOR_KEYS = Object.keys( ARMORS );
 
 const TYPES = {
 	block: {
@@ -31,6 +73,7 @@ const TYPES = {
 		wood: [ 'maple', 'semigloss' ],
 		mountAxis: Y_AXIS, mountDepth: 0.25,
 		friction: 0.6, restitution: 0.05,
+		hp: 110, dmg: 1.0, weapon: false, defaultArmor: 'wood',
 		icon: '<rect x="10" y="10" width="28" height="28" rx="7"/>'
 	},
 	plank: {
@@ -40,6 +83,7 @@ const TYPES = {
 		wood: [ 'teak', 'semigloss' ],
 		mountAxis: Y_AXIS, mountDepth: 0.075,
 		friction: 0.6, restitution: 0.05,
+		hp: 70, dmg: 1.0, weapon: false, defaultArmor: 'wood',
 		icon: '<rect x="4" y="18" width="40" height="12" rx="5"/>'
 	},
 	wheel: {
@@ -49,6 +93,7 @@ const TYPES = {
 		wood: [ 'walnut', 'gloss' ],
 		mountAxis: Z_AXIS, mountDepth: 0.08,
 		friction: 1.0, restitution: 0.05,
+		hp: 80, dmg: 0.8, weapon: false, defaultArmor: 'wood',
 		icon: '<circle cx="24" cy="24" r="16"/><circle cx="24" cy="24" r="4" fill="#77502b"/>'
 	},
 	ball: {
@@ -57,12 +102,75 @@ const TYPES = {
 		defaultSize: { radius: 0.24 },
 		wood: [ 'cherry', 'gloss' ],
 		mountAxis: Y_AXIS, mountDepth: 0.24,
-		friction: 0.7, restitution: 0.55,
+		friction: 0.45, restitution: 0.55, // slippery — balls work as casters
+		hp: 90, dmg: 1.0, weapon: false, defaultArmor: 'wood',
 		icon: '<circle cx="24" cy="24" r="15"/>'
+	},
+	wedge: {
+		name: 'Wedge',
+		kind: 'wedge',
+		defaultSize: { x: 0.7, y: 0.35, z: 0.7 },
+		wood: [ 'teak', 'semigloss' ],
+		mountAxis: Y_AXIS, mountDepth: 0.175,
+		friction: 0.35, restitution: 0.05,
+		hp: 130, dmg: 1.3, weapon: false, defaultArmor: 'steel',
+		icon: '<polygon points="8,36 40,36 8,12"/>'
+	},
+	bar: {
+		name: 'Bar',
+		kind: 'box',
+		defaultSize: { x: 1.4, y: 0.12, z: 0.2 },
+		wood: [ 'teak', 'semigloss' ],
+		mountAxis: Y_AXIS, mountDepth: 0.06,
+		friction: 0.5, restitution: 0.1,
+		hp: 100, dmg: 2.6, weapon: true, defaultArmor: 'steel',
+		icon: '<rect x="4" y="20" width="40" height="8" rx="3"/><circle cx="24" cy="24" r="3" fill="#77502b"/>'
+	},
+	saw: {
+		name: 'Saw',
+		kind: 'cylinder', shape: 'saw',
+		defaultSize: { radius: 0.3, width: 0.08 },
+		wood: [ 'walnut', 'gloss' ],
+		mountAxis: Z_AXIS, mountDepth: 0.04,
+		friction: 0.5, restitution: 0.1,
+		hp: 80, dmg: 3.2, weapon: true, defaultArmor: 'steel',
+		icon: '<polygon points="41,24 34.6,28.4 36,36 28.4,34.6 24,41 19.6,34.6 12,36 13.4,28.4 7,24 13.4,19.6 12,12 19.6,13.4 24,7 28.4,13.4 36,12 34.6,19.6"/><circle cx="24" cy="24" r="4" fill="#5c636e"/>'
+	},
+	spike: {
+		name: 'Spike',
+		kind: 'cone',
+		defaultSize: { radius: 0.1, height: 0.3 },
+		wood: [ 'maple', 'semigloss' ],
+		mountAxis: Y_AXIS, mountDepth: 0.15,
+		friction: 0.5, restitution: 0.1,
+		hp: 90, dmg: 2.2, weapon: true, defaultArmor: 'steel',
+		icon: '<polygon points="24,6 34,40 14,40"/>'
+	},
+	mace: {
+		name: 'Mace',
+		kind: 'sphere', shape: 'mace',
+		defaultSize: { radius: 0.16 },
+		wood: [ 'cherry', 'gloss' ],
+		mountAxis: Y_AXIS, mountDepth: 0.16,
+		friction: 0.6, restitution: 0.2,
+		hp: 110, dmg: 2.4, weapon: true, defaultArmor: 'steel',
+		icon: '<polygon points="41,24 32.3,27.4 36,36 27.4,32.3 24,41 20.6,32.3 12,36 15.7,27.4 7,24 15.7,20.6 12,12 20.6,15.7 24,7 27.4,15.7 36,12 32.3,20.6"/><circle cx="24" cy="24" r="8"/>'
 	}
 };
 
 const TYPE_KEYS = Object.keys( TYPES );
+
+// how a bot drives itself — picked per robot, seeded per battle
+
+const AI_STYLES = {
+	brawler: { name: 'Brawler', maxSpeed: 3.4 },
+	orbiter: { name: 'Circler', maxSpeed: 2.7 },
+	skirmisher: { name: 'Skirmisher', maxSpeed: 3.0 }
+};
+
+const AI_KEYS = Object.keys( AI_STYLES );
+
+const FIGHTER_COLORS = [ '#e2543e', '#3e8fe2', '#e2a53e', '#52b788', '#b05fd0', '#7f8c8d' ];
 
 const HANDLE_DIRS = [
 	new THREE.Vector3( 1, 0, 0 ), new THREE.Vector3( - 1, 0, 0 ),
@@ -83,21 +191,72 @@ let recording = null;
 let shareUrl = '';
 let shareVideoUrl = null;
 let scene, camera, renderer, controls, postProcessing;
+let METALS = null; // steel / titanium materials, built in init
 
 let mode = 'build';
-let toys = [];
-let activeToy = null;
-let focusToy = null; // camera focus in play mode, null = all toys
+let robots = [];
+let activeBot = null;
+let focusBot = null; // camera focus in battle, null = whole arena
 let selected = null;
 let handles = [];
 let drag = null;
 let resize = null;
 let pivotDrag = null;
 let moveDrag = null;
-let physics = null;
+let battle = null;
+let battleSeed = 1 + Math.floor( Math.random() * 99999 );
+
+// ?seed=123 pins the battle seed — same seed, same fight
+
+{
+
+	const requested = Number.parseInt( new URLSearchParams( location.search ).get( 'seed' ), 10 );
+	if ( Number.isInteger( requested ) && requested > 0 ) battleSeed = requested;
+
+}
+
+// a peek at the running battle, for debugging and curious folk
+
+window.__rw = () => battle === null ? null : battle.fighters.map( ( fighter ) => {
+
+	const dead = fighter.rootRec.destroyed;
+	const p = dead ? { x: 0, y: 0, z: 0 } : b3.b3Body_GetPosition( fighter.rootRec.body );
+	const v = dead ? { x: 0, y: 0, z: 0 } : b3.b3Body_GetLinearVelocity( fighter.rootRec.body );
+	const w = dead ? { x: 0, y: 0, z: 0 } : b3.b3Body_GetAngularVelocity( fighter.rootRec.body );
+
+	const wheelRec = fighter.bodies.find( ( rec ) => rec.destroyed === false && rec.key !== null && rec.key.type === 'wheel' );
+	const ws = wheelRec === undefined ? null : b3.b3Body_GetAngularVelocity( wheelRec.body );
+	const weaponRec = fighter.bodies.find( ( rec ) => rec.destroyed === false && rec.key !== null && rec.key.spin !== 0 );
+	const wps = weaponRec === undefined ? null : b3.b3Body_GetAngularVelocity( weaponRec.body );
+
+	return {
+		name: fighter.name,
+		alive: fighter.alive,
+		status: fighter.status,
+		still: Math.round( fighter.still * 10 ) / 10,
+		damage: Math.round( fighter.damage ),
+		totalHp: Math.round( fighter.totalHp ),
+		bodies: fighter.bodies.filter( ( rec ) => rec.destroyed === false ).length,
+		awake: dead ? false : b3.b3Body_IsAwake( fighter.rootRec.body ),
+		mass: Math.round( fighter.mass ),
+		x: Math.round( p.x * 100 ) / 100,
+		z: Math.round( p.z * 100 ) / 100,
+		speed: Math.round( Math.hypot( v.x, v.y, v.z ) * 100 ) / 100,
+		spin: Math.round( Math.hypot( w.x, w.y, w.z ) * 100 ) / 100,
+		wheelSpin: ws === null ? null : Math.round( Math.hypot( ws.x, ws.y, ws.z ) * 100 ) / 100,
+		weaponSpin: wps === null ? null : Math.round( Math.hypot( wps.x, wps.y, wps.z ) * 100 ) / 100,
+		dbg: fighter.dbg ?? null
+	};
+
+} );
 let physicsAcc = 0;
 let restoring = false;
-let viewingShared = false; // bench loaded from someone's link
+let viewingShared = false; // garage loaded from someone's link
+let botCounter = 0;
+let commTab = 'top';
+let toastTimer = null;
+
+const SAMPLES = makeSamples( TYPE_KEYS, ARMOR_KEYS, AI_KEYS );
 
 const timer = new THREE.Timer();
 const raycaster = new THREE.Raycaster();
@@ -109,6 +268,12 @@ const _v2 = new THREE.Vector3();
 const _q1 = new THREE.Quaternion();
 const _q2 = new THREE.Quaternion();
 
+// battle-only temps, so the sim never trips over the build gizmo temps
+
+const _bv1 = new THREE.Vector3();
+const _bv2 = new THREE.Vector3();
+const _bq1 = new THREE.Quaternion();
+
 const ghostMaterial = new THREE.MeshStandardMaterial( { transparent: true, opacity: 0.5, depthWrite: false, roughness: 0.8 } );
 const ringMaterial = new THREE.MeshBasicMaterial( { color: 0xff9f2e, transparent: true, opacity: 0.6, depthWrite: false } );
 const dotMaterial = new THREE.MeshStandardMaterial( { color: 0xff9f2e, emissive: 0xff9f2e, emissiveIntensity: 0.25, roughness: 0.35 } );
@@ -118,6 +283,18 @@ const markerMaterial = new THREE.MeshStandardMaterial( { color: 0x3bb2a0, emissi
 const handleGeometry = new THREE.ConeGeometry( 0.05, 0.12, 12 );
 const handleMaterial = new THREE.MeshStandardMaterial( { color: 0xff8a2a, emissive: 0xff8a2a, emissiveIntensity: 0.25, roughness: 0.35, transparent: true, opacity: 0.95, depthTest: false } );
 const handleHoverMaterial = new THREE.MeshStandardMaterial( { color: 0xffc36b, emissive: 0xffc36b, emissiveIntensity: 0.5, roughness: 0.35, depthTest: false } );
+
+// scorch marks left where hits land
+
+const markGeometry = new THREE.SphereGeometry( 1, 8, 6 );
+const markMaterial = new THREE.MeshStandardMaterial( { color: 0x241a12, roughness: 1 } );
+
+// arena dressing
+
+const arenaFloorMaterial = new THREE.MeshStandardMaterial( { color: 0xa8977a, roughness: 0.9 } );
+const arenaWallMaterial = new THREE.MeshStandardMaterial( { color: 0x6f5a40, roughness: 0.85 } );
+const arenaHazardMaterial = new THREE.MeshStandardMaterial( { color: 0x8a4030, roughness: 0.8 } );
+const arenaPostMaterial = new THREE.MeshStandardMaterial( { color: 0x4a3826, roughness: 0.8 } );
 
 function viewSize() {
 
@@ -159,10 +336,25 @@ async function init() {
 	eventsBuffer = b3.createEventsBuffer();
 	hitEvent = b3.createContactHitEvent();
 
+	METALS = {
+		steel: new THREE.MeshStandardMaterial( { color: 0x9aa2ab, metalness: 0.85, roughness: 0.4 } ),
+		titanium: new THREE.MeshStandardMaterial( { color: 0x565d6b, metalness: 0.9, roughness: 0.32 } )
+	};
+
+	// the TSL wood shader only compiles on real WebGPU — on the WebGL2
+	// fallback it renders black, so fall back to plain wood tones there
+
+	const realWebGPU = renderer.backend?.isWebGPUBackend === true;
+
+	const WOOD_TONES = { maple: 0xdcbd8f, teak: 0x9c6b3f, walnut: 0x5d4230, cherry: 0x9c4a33 };
+
 	for ( const def of Object.values( TYPES ) ) {
 
-		def.material = WoodNodeMaterial.fromPreset( def.wood[ 0 ], def.wood[ 1 ] );
+		def.material = realWebGPU
+			? WoodNodeMaterial.fromPreset( def.wood[ 0 ], def.wood[ 1 ] )
+			: new THREE.MeshStandardMaterial( { color: WOOD_TONES[ def.wood[ 0 ] ], roughness: def.wood[ 1 ] === 'gloss' ? 0.45 : 0.7 } );
 		def.geometry = buildGeometry( def, def.defaultSize ); // ghost preview
+		def.volume = volumeFor( def, def.defaultSize );
 
 	}
 
@@ -179,7 +371,7 @@ async function init() {
 	controls.dampingFactor = 0.08;
 	controls.maxPolarAngle = Math.PI * 0.495;
 	controls.minDistance = 2;
-	controls.maxDistance = 18;
+	controls.maxDistance = 24;
 
 	const pmremGenerator = new THREE.PMREMGenerator( renderer );
 	const environment = new RoomEnvironment();
@@ -237,7 +429,7 @@ async function init() {
 
 	groundMesh = b3.b3CreateMesh( Array.from( groundGeometry.attributes.position.array ), groundIndices );
 
-	// scattered tiles on the floor, so you can tell where a toy is heading
+	// scattered tiles on the floor, so you can tell where a bot is heading
 
 	const tileCount = 420;
 	const tiles = new THREE.InstancedMesh(
@@ -290,24 +482,120 @@ async function init() {
 	postProcessing.outputColorTransform = false;
 	postProcessing.outputNode = fxaa( scenePass.getTextureNode().renderOutput() );
 
+	initParticles();
 	buildPalette();
 	bindEvents();
-	addToy();
+	addBot();
 	loadFromHash();
 	if ( allPieces().length === 0 ) loadLocal();
-	else if ( viewingShared ) loadLocal( true ); // your toys tag along, benched
+	else if ( viewingShared ) loadLocal( true ); // your own bots tag along, benched
 	updateHint();
+	updateBotBar();
 
 	document.getElementById( 'loading' ).remove();
 	renderer.setAnimationLoop( animate );
 
-	// a shared link goes straight to the show
+	if ( viewingShared && allPieces().length > 0 ) {
 
-	if ( viewingShared && allPieces().length > 0 ) setMode( 'play' );
+		// a shared link goes straight to the fight
+
+		setMode( 'battle' );
+
+	} else if ( allPieces().length === 0 ) {
+
+		document.getElementById( 'splash' ).hidden = false;
+
+	}
+
+}
+
+// geometry
+
+function sawGeometry( radius, width ) {
+
+	// a toothed disc — the teeth lean so it reads as a saw from any angle
+
+	const teeth = 10;
+	const inner = radius * 0.72;
+	const shape = new THREE.Shape();
+
+	for ( let i = 0; i < teeth; i ++ ) {
+
+		const a0 = ( i / teeth ) * Math.PI * 2;
+		const a1 = ( ( i + 0.5 ) / teeth ) * Math.PI * 2;
+		const a2 = ( ( i + 0.62 ) / teeth ) * Math.PI * 2;
+
+		if ( i === 0 ) shape.moveTo( Math.cos( a0 ) * inner, Math.sin( a0 ) * inner );
+		else shape.lineTo( Math.cos( a0 ) * inner, Math.sin( a0 ) * inner );
+
+		shape.lineTo( Math.cos( a1 ) * radius, Math.sin( a1 ) * radius );
+		shape.lineTo( Math.cos( a2 ) * inner, Math.sin( a2 ) * inner );
+
+	}
+
+	shape.closePath();
+
+	const geometry = new THREE.ExtrudeGeometry( shape, { depth: width, bevelEnabled: false } );
+	geometry.translate( 0, 0, - width / 2 );
+
+	return geometry;
+
+}
+
+function wedgeGeometry( sx, sy, sz ) {
+
+	// a triangular prism, slope facing +x — the classic scoop
+
+	const shape = new THREE.Shape();
+	shape.moveTo( - sx / 2, - sy / 2 );
+	shape.lineTo( sx / 2, - sy / 2 );
+	shape.lineTo( - sx / 2, sy / 2 );
+	shape.closePath();
+
+	const geometry = new THREE.ExtrudeGeometry( shape, { depth: sz, bevelEnabled: false } );
+	geometry.translate( 0, 0, - sz / 2 );
+
+	return geometry;
+
+}
+
+function maceGeometry( radius ) {
+
+	// a ball bristling with cones, one per icosahedron vertex
+
+	const parts = [ new THREE.SphereGeometry( radius * 0.82, 20, 14 ).toNonIndexed() ];
+
+	const icosa = new THREE.IcosahedronGeometry( 1, 0 );
+	const positions = icosa.getAttribute( 'position' );
+	const seen = new Set();
+	const dir = new THREE.Vector3();
+	const quat = new THREE.Quaternion();
+
+	for ( let i = 0; i < positions.count; i ++ ) {
+
+		dir.fromBufferAttribute( positions, i ).normalize();
+		const key = `${ dir.x.toFixed( 2 ) },${ dir.y.toFixed( 2 ) },${ dir.z.toFixed( 2 ) }`;
+		if ( seen.has( key ) ) continue;
+		seen.add( key );
+
+		const spike = new THREE.ConeGeometry( radius * 0.28, radius * 0.9, 8 ).toNonIndexed();
+		quat.setFromUnitVectors( Y_AXIS, dir );
+		spike.applyQuaternion( quat );
+		spike.translate( dir.x * radius * 0.55, dir.y * radius * 0.55, dir.z * radius * 0.55 );
+		parts.push( spike );
+
+	}
+
+	icosa.dispose();
+
+	return BufferGeometryUtils.mergeGeometries( parts );
 
 }
 
 function buildGeometry( def, size ) {
+
+	if ( def.shape === 'saw' ) return sawGeometry( size.radius, size.width );
+	if ( def.shape === 'mace' ) return maceGeometry( size.radius );
 
 	switch ( def.kind ) {
 
@@ -324,138 +612,188 @@ function buildGeometry( def, size ) {
 		case 'sphere':
 			return new THREE.SphereGeometry( size.radius, 32, 20 );
 
+		case 'cone':
+			return new THREE.ConeGeometry( size.radius, size.height, 20 );
+
+		case 'wedge':
+			return wedgeGeometry( size.x, size.y, size.z );
+
 	}
 
 }
 
-// toys
+function volumeFor( def, size ) {
+
+	switch ( def.kind ) {
+
+		case 'box': return size.x * size.y * size.z;
+		case 'wedge': return size.x * size.y * size.z / 2;
+		case 'cylinder': return Math.PI * size.radius * size.radius * size.width;
+		case 'sphere': return ( 4 / 3 ) * Math.PI * size.radius ** 3;
+		case 'cone': return Math.PI * size.radius * size.radius * size.height / 3;
+
+	}
+
+}
+
+function volumeOf( piece ) {
+
+	return volumeFor( TYPES[ piece.type ], piece.size );
+
+}
+
+function pieceWeight( piece ) {
+
+	return volumeOf( piece ) * DENSITY * ARMORS[ piece.armor ].density;
+
+}
+
+function botWeight( bot ) {
+
+	let total = 0;
+	for ( const piece of bot.pieces ) total += pieceWeight( piece );
+	return total;
+
+}
+
+function pieceMaxHp( piece ) {
+
+	const def = TYPES[ piece.type ];
+	const sizeFactor = Math.max( Math.pow( volumeOf( piece ) / def.volume, 0.6 ), 0.35 );
+	return def.hp * ARMORS[ piece.armor ].hp * sizeFactor;
+
+}
+
+function materialFor( type, armor ) {
+
+	return armor === 'wood' ? TYPES[ type ].material : METALS[ armor ];
+
+}
+
+// robots
 
 function allPieces() {
 
 	const list = [];
 
-	for ( const toy of toys ) list.push( ...toy.pieces );
+	for ( const bot of robots ) list.push( ...bot.pieces );
 
 	return list;
 
 }
 
-function setActiveToy( toy ) {
+function setActiveBot( bot ) {
 
-	if ( toy === activeToy ) return;
+	if ( bot === activeBot ) return;
 
 	select( null );
 
-	activeToy = toy;
-	toy.visible = true; // editing a toy puts it on stage
-	toys = toys.filter( ( t ) => t.pieces.length > 0 || t === toy );
+	activeBot = bot;
+	robots = robots.filter( ( b ) => b.pieces.length > 0 || b === bot );
 
 	refreshVisibility();
-	updateToysList();
+	updateBotsList();
+	updateBotBar();
 	updateHint();
 
 }
 
-function addToy() {
+function addBot() {
 
-	const toy = { pieces: [], visible: true };
-	toys.push( toy );
-	setActiveToy( toy );
+	const bot = { pieces: [], inBattle: true, name: `Bot ${ ++ botCounter }`, ai: 0, temp: false };
+	robots.push( bot );
+	setActiveBot( bot );
+
+	return bot;
 
 }
 
 function refreshVisibility() {
 
-	for ( const toy of toys ) {
+	for ( const bot of robots ) {
 
-		const visible = mode === 'play' ? toy.visible : toy === activeToy;
+		const visible = mode === 'battle' ? bot.inBattle : bot === activeBot;
 
-		for ( const piece of toy.pieces ) piece.mesh.visible = visible;
+		for ( const piece of bot.pieces ) piece.mesh.visible = visible;
 
 	}
 
 }
 
-function appendEyeAction( button, toy ) {
+function updateBotsList() {
 
-	const eye = document.createElement( 'span' );
-	eye.className = 'toy-eye';
-	eye.textContent = toy.visible ? '●' : '○';
-	eye.title = 'Show in play mode';
-
-	eye.addEventListener( 'click', ( event ) => {
-
-		event.stopPropagation();
-
-		toy.visible = ! toy.visible;
-		if ( toy.visible === false && focusToy === toy ) focusToy = null;
-
-		if ( mode === 'play' ) resetPlay();
-
-		refreshVisibility();
-		updateToysList();
-
-	} );
-
-	button.appendChild( eye );
-
-}
-
-function updateToysList() {
-
-	const container = document.getElementById( 'toys' );
+	const container = document.getElementById( 'robots' );
 	container.textContent = '';
 
-	if ( mode === 'play' ) {
+	if ( mode === 'battle' ) {
 
-		// in play the list picks which toy the camera follows
+		// in battle the list picks which bot the camera follows
 
 		const all = document.createElement( 'button' );
-		all.className = 'toy-btn' + ( focusToy === null ? ' active' : '' );
-		all.textContent = 'All toys';
-		all.addEventListener( 'click', () => { focusToy = null; updateToysList(); } );
+		all.className = 'bot-btn' + ( focusBot === null ? ' active' : '' );
+		all.textContent = 'Whole arena';
+		all.addEventListener( 'click', () => { focusBot = null; updateBotsList(); } );
 		container.appendChild( all );
 
-		toys.forEach( ( toy, index ) => {
+		if ( battle !== null ) {
 
-			if ( toy.pieces.length === 0 ) return;
+			for ( const fighter of battle.fighters ) {
 
-			const button = document.createElement( 'button' );
-			button.className = 'toy-btn' + ( toy === focusToy ? ' active' : '' );
-			button.addEventListener( 'click', () => { if ( toy.visible ) { focusToy = toy; updateToysList(); } } );
+				const button = document.createElement( 'button' );
+				button.className = 'bot-btn' + ( fighter.bot === focusBot ? ' active' : '' );
 
-			appendEyeAction( button, toy );
+				const label = document.createElement( 'span' );
+				label.className = 'bot-label';
+				label.textContent = fighter.name;
+				button.appendChild( label );
 
-			const label = document.createElement( 'span' );
-			label.className = 'toy-label';
-			label.textContent = `Toy ${ index + 1 }`;
-			button.appendChild( label );
+				button.addEventListener( 'click', () => { focusBot = fighter.bot; updateBotsList(); } );
+				container.appendChild( button );
 
-			container.appendChild( button );
+			}
 
-		} );
+		}
 
 		return;
 
 	}
 
-	toys.forEach( ( toy, index ) => {
+	robots.forEach( ( bot ) => {
+
+		if ( bot.temp ) return;
 
 		const button = document.createElement( 'button' );
-		button.className = 'toy-btn' + ( toy === activeToy ? ' active' : '' );
-		button.addEventListener( 'click', () => setActiveToy( toy ) );
+		button.className = 'bot-btn' + ( bot === activeBot ? ' active' : '' );
+		button.addEventListener( 'click', () => setActiveBot( bot ) );
 
-		appendEyeAction( button, toy );
+		const flag = document.createElement( 'span' );
+		flag.className = 'bot-flag' + ( bot.inBattle ? '' : ' off' );
+		flag.textContent = '⚔';
+		flag.title = 'Fights in battle mode';
+		flag.addEventListener( 'click', ( event ) => {
+
+			event.stopPropagation();
+			bot.inBattle = ! bot.inBattle;
+			updateBotsList();
+
+		} );
+		button.appendChild( flag );
 
 		const label = document.createElement( 'span' );
-		label.className = 'toy-label';
-		label.textContent = `Toy ${ index + 1 } · ${ toy.pieces.length }`;
+		label.className = 'bot-label';
+		label.textContent = bot.name;
+
+		const sub = document.createElement( 'span' );
+		sub.className = 'bot-sub';
+		sub.textContent = bot.pieces.length === 0 ? 'empty' : `${ botWeight( bot ).toFixed( 1 ) } kg · ${ bot.pieces.length } parts`;
+		label.appendChild( sub );
+
 		button.appendChild( label );
 
 		const del = document.createElement( 'span' );
-		del.className = 'toy-del';
+		del.className = 'bot-del';
 		del.textContent = '✕';
-		del.addEventListener( 'click', ( event ) => { event.stopPropagation(); deleteToy( toy ); } );
+		del.addEventListener( 'click', ( event ) => { event.stopPropagation(); deleteBot( bot ); } );
 		button.appendChild( del );
 
 		container.appendChild( button );
@@ -463,38 +801,38 @@ function updateToysList() {
 	} );
 
 	const add = document.createElement( 'button' );
-	add.className = 'toy-btn new';
-	add.textContent = '+ New toy';
-	add.addEventListener( 'click', addToy );
+	add.className = 'bot-btn new';
+	add.textContent = '+ New robot';
+	add.addEventListener( 'click', () => addBot() );
 	container.appendChild( add );
 
 }
 
-function deleteToy( toy ) {
+function deleteBot( bot ) {
 
-	if ( toy.pieces.length > 0 && ! window.confirm( 'Delete this toy?' ) ) return;
+	if ( bot.pieces.length > 0 && ! window.confirm( `Scrap ${ bot.name }?` ) ) return;
 
 	select( null );
 
-	for ( const piece of toy.pieces ) destroyPiece( piece );
-	toy.pieces = [];
+	for ( const piece of bot.pieces ) destroyPiece( piece );
+	bot.pieces = [];
 
-	toys = toys.filter( ( t ) => t !== toy );
+	robots = robots.filter( ( b ) => b !== bot );
 
-	if ( toys.length === 0 ) addToy();
-	else if ( activeToy === toy ) setActiveToy( toys[ 0 ] );
-	else updateToysList();
+	if ( robots.length === 0 ) addBot();
+	else if ( activeBot === bot ) setActiveBot( robots[ 0 ] );
+	else updateBotsList();
 
 	saveLocal();
 	updateHint();
 
 }
 
-function toyOf( piece ) {
+function botOf( piece ) {
 
-	for ( const toy of toys ) {
+	for ( const bot of robots ) {
 
-		if ( toy.pieces.includes( piece ) ) return toy;
+		if ( bot.pieces.includes( piece ) ) return bot;
 
 	}
 
@@ -502,74 +840,305 @@ function toyOf( piece ) {
 
 }
 
-// sharing
+// the little card in build mode: name, weight, drive style
 
-function serializeToy( toy ) {
+function updateBotBar() {
+
+	if ( activeBot === null ) return;
+
+	document.getElementById( 'botNameBtn' ).textContent = `✎ ${ activeBot.name }`;
+	document.getElementById( 'botWeight' ).textContent = activeBot.pieces.length === 0
+		? '⚖ empty'
+		: `⚖ ${ botWeight( activeBot ).toFixed( 1 ) } kg`;
+	document.getElementById( 'botAiSelect' ).selectedIndex = activeBot.ai;
+
+}
+
+function renameActiveBot() {
+
+	const name = window.prompt( 'Robot name', activeBot.name );
+	if ( name === null || name.trim() === '' ) return;
+
+	activeBot.name = name.trim().slice( 0, 24 );
+	updateBotBar();
+	updateBotsList();
+	saveLocal();
+
+}
+
+// sharing + saving — rows are [type, parent, spin, pos, normal, size…, pivot, armor]
+
+function serializeBot( bot ) {
 
 	const r3 = ( value ) => Math.round( value * 1000 ) / 1000;
 
-	return toy.pieces.map( ( piece ) => {
+	const rows = bot.pieces.map( ( piece ) => {
 
 		const size = piece.size;
 		const kind = TYPES[ piece.type ].kind;
-		const sizeArray = kind === 'box' ? [ size.x, size.y, size.z ] : kind === 'cylinder' ? [ size.radius, size.width ] : [ size.radius ];
+		const sizeArray = ( kind === 'box' || kind === 'wedge' ) ? [ size.x, size.y, size.z ]
+			: kind === 'cylinder' ? [ size.radius, size.width ]
+			: kind === 'cone' ? [ size.radius, size.height ]
+			: [ size.radius ];
 
 		return [
 			TYPE_KEYS.indexOf( piece.type ),
-			toy.pieces.indexOf( piece.parent ), // -1 for the toy root
+			bot.pieces.indexOf( piece.parent ), // -1 for the bot root
 			piece.spin,
 			r3( piece.position.x ), r3( piece.position.y ), r3( piece.position.z ),
 			piece.attachNormal.x, piece.attachNormal.y, piece.attachNormal.z,
 			...sizeArray.map( r3 ),
-			r3( piece.pivot.x ), r3( piece.pivot.y ), r3( piece.pivot.z )
+			r3( piece.pivot.x ), r3( piece.pivot.y ), r3( piece.pivot.z ),
+			ARMOR_KEYS.indexOf( piece.armor )
 		];
 
 	} );
 
-}
-
-function serializeToys( visibleOnly = false ) {
-
-	return toys.filter( ( toy ) => toy.pieces.length > 0 && ( visibleOnly === false || toy.visible ) ).map( serializeToy );
+	return { n: bot.name, a: bot.ai, p: rows };
 
 }
 
-function buildShareUrl() {
+function serializeGarage( rosterOnly = false ) {
 
-	// only what is on stage gets shared — benched toys stay private
+	return robots
+		.filter( ( bot ) => bot.pieces.length > 0 && bot.temp === false && ( rosterOnly === false || bot.inBattle ) )
+		.map( serializeBot );
+
+}
+
+function buildShareUrl( bots ) {
 
 	const url = new URL( location.href );
-	url.hash = btoa( JSON.stringify( serializeToys( true ) ) ).replaceAll( '+', '-' ).replaceAll( '/', '_' ).replace( /=+$/, '' );
+	url.hash = btoa( JSON.stringify( bots.map( serializeBot ) ) ).replaceAll( '+', '-' ).replaceAll( '/', '_' ).replace( /=+$/, '' );
 	return url.href;
 
 }
 
-// share: record a few seconds of play, then show the clip and the link
+function loadRobots( data, benched = false ) {
+
+	restoring = true;
+	const created = [];
+
+	for ( const entry of data ) {
+
+		// legacy entries are bare row arrays; new ones carry a name and ai style
+
+		const rows = Array.isArray( entry ) ? entry : entry.p;
+		if ( ! Array.isArray( rows ) || rows.length === 0 ) continue;
+
+		const bot = addBot();
+		if ( Array.isArray( entry ) === false ) {
+
+			if ( typeof entry.n === 'string' && entry.n.trim() !== '' ) bot.name = entry.n.trim().slice( 0, 24 );
+			if ( Number.isInteger( entry.a ) && entry.a >= 0 && entry.a < AI_KEYS.length ) bot.ai = entry.a;
+
+		}
+
+		if ( benched ) bot.inBattle = false;
+		created.push( bot );
+
+		for ( const row of rows ) {
+
+			const [ typeIndex, parentIndex, spin, x, y, z, nx, ny, nz, ...rest ] = row;
+
+			const type = TYPE_KEYS[ typeIndex ];
+			if ( type === undefined ) continue;
+			const def = TYPES[ type ];
+			const normal = new THREE.Vector3( nx, ny, nz );
+
+			const placement = {
+				position: new THREE.Vector3( x, y, z ),
+				quaternion: new THREE.Quaternion().setFromUnitVectors( def.mountAxis, normal ),
+				normal
+			};
+
+			const piece = addPiece( type, placement, parentIndex >= 0 ? bot.pieces[ parentIndex ] : null );
+
+			const kind = def.kind;
+			if ( kind === 'box' || kind === 'wedge' ) piece.size = { x: rest[ 0 ], y: rest[ 1 ], z: rest[ 2 ] };
+			else if ( kind === 'cylinder' ) piece.size = { radius: rest[ 0 ], width: rest[ 1 ] };
+			else if ( kind === 'cone' ) piece.size = { radius: rest[ 0 ], height: rest[ 1 ] };
+			else piece.size = { radius: rest[ 0 ] };
+
+			const sizeCount = ( kind === 'box' || kind === 'wedge' ) ? 3 : kind === 'sphere' ? 1 : 2;
+
+			if ( rest.length >= sizeCount + 3 ) piece.pivot.set( rest[ sizeCount ], rest[ sizeCount + 1 ], rest[ sizeCount + 2 ] );
+
+			if ( rest.length >= sizeCount + 4 ) {
+
+				const armor = ARMOR_KEYS[ rest[ sizeCount + 3 ] ];
+				if ( armor !== undefined ) piece.armor = armor;
+
+			}
+
+			piece.mesh.geometry.dispose();
+			piece.mesh.geometry = buildGeometry( def, piece.size );
+			piece.mesh.material = materialFor( piece.type, piece.armor );
+
+			if ( spin !== 0 ) setSpin( piece, spin );
+
+		}
+
+	}
+
+	restoring = false;
+
+	return created;
+
+}
+
+function loadFromHash() {
+
+	const hash = location.hash.slice( 1 );
+	if ( hash === '' ) return;
+
+	try {
+
+		const bots = loadRobots( JSON.parse( atob( hash.replaceAll( '-', '+' ).replaceAll( '_', '/' ) ) ) );
+		if ( bots.length > 0 ) setActiveBot( bots[ 0 ] );
+		viewingShared = true;
+
+	} catch ( error ) {
+
+		console.warn( 'could not load robots from url', error );
+
+	} finally {
+
+		restoring = false;
+
+	}
+
+}
+
+function saveLocal() {
+
+	if ( restoring ) return;
+
+	// an edit makes the garage yours again — drop any shared-link hash
+
+	if ( location.hash !== '' ) history.replaceState( null, '', location.pathname + location.search );
+
+	try {
+
+		if ( serializeGarage().length > 0 ) localStorage.setItem( STORAGE_KEY, JSON.stringify( serializeGarage() ) );
+		else localStorage.removeItem( STORAGE_KEY );
+
+	} catch ( error ) {
+
+		// storage unavailable — not fatal
+
+	}
+
+}
+
+function loadLocal( benched = false ) {
+
+	try {
+
+		const json = localStorage.getItem( STORAGE_KEY );
+
+		if ( json !== null ) {
+
+			const bots = loadRobots( JSON.parse( json ), benched );
+			if ( benched === false && bots.length > 0 ) setActiveBot( bots[ 0 ] );
+
+		}
+
+	} catch ( error ) {
+
+		console.warn( 'could not load saved robots', error );
+
+	} finally {
+
+		restoring = false;
+
+	}
+
+}
+
+function loadSampleBots( benched = false ) {
+
+	const bots = loadRobots( SAMPLES, benched );
+	saveLocal();
+	updateBotsList();
+
+	return bots;
+
+}
+
+// share: a link with the creation encoded in the url — the current robot
+// from the workshop, or the whole roster from a battle
 
 function openShare() {
 
-	if ( allPieces().length === 0 || recording !== null ) return;
+	if ( mode === 'battle' ) {
 
-	shareUrl = buildShareUrl();
+		const roster = robots.filter( ( bot ) => bot.pieces.length > 0 && bot.inBattle );
+		if ( roster.length === 0 ) return;
 
-	if ( mode !== 'play' ) setMode( 'play' );
+		shareUrl = buildShareUrl( roster );
+		document.getElementById( 'shareLinkLabel' ).textContent = 'Share this battle';
+
+	} else {
+
+		if ( activeBot === null || activeBot.pieces.length === 0 ) {
+
+			showToast( 'build something first — then share it' );
+			return;
+
+		}
+
+		shareUrl = buildShareUrl( [ activeBot ] );
+		document.getElementById( 'shareLinkLabel' ).textContent = `Share ${ activeBot.name }`;
+
+	}
+
+	showShareModal( null );
+
+}
+
+// recording: a manual start/stop clip of the fight
+
+function toggleRecording() {
+
+	if ( recording !== null ) {
+
+		if ( recording.finishing === false ) finishRecording();
+		return;
+
+	}
+
+	if ( mode !== 'battle' ) setMode( 'battle' );
+	if ( mode !== 'battle' ) return; // no roster — setMode refused
 
 	if ( 'VideoEncoder' in window ) {
 
 		try {
 
 			startRecording();
-			return;
 
 		} catch ( error ) {
 
 			console.warn( 'recording unavailable', error );
+			showToast( 'recording is not supported in this browser' );
 
 		}
 
+	} else {
+
+		showToast( 'recording is not supported in this browser' );
+
 	}
 
-	showShareModal( null );
+	updateRecButton();
+
+}
+
+function updateRecButton() {
+
+	const button = document.getElementById( 'recBtn' );
+	button.textContent = recording !== null && recording.finishing === false ? '■ Stop' : '● Rec';
+	button.classList.toggle( 'recording', recording !== null );
 
 }
 
@@ -656,9 +1225,9 @@ function captureFrame() {
 	frame.close();
 
 	rec.frame ++;
-	document.getElementById( 'recBadge' ).textContent = `● recording · ${ ( rec.frame / REC_FPS ).toFixed( 1 ) }s`;
+	document.getElementById( 'recBadge' ).textContent = `● recording · ${ ( rec.frame / REC_FPS ).toFixed( 1 ) }s — press stop when done`;
 
-	if ( rec.frame >= REC_FRAMES ) finishRecording();
+	if ( rec.frame >= REC_MAX_FRAMES ) finishRecording();
 
 }
 
@@ -678,13 +1247,18 @@ async function finishRecording() {
 
 		const mp4 = createMP4( rec.chunks, rec.codecConfig, rec.width, rec.height, REC_FPS );
 		recording = null;
+		updateRecButton();
+
+		const roster = robots.filter( ( bot ) => bot.pieces.length > 0 && bot.inBattle );
+		shareUrl = buildShareUrl( roster );
+		document.getElementById( 'shareLinkLabel' ).textContent = 'Share this battle';
 		showShareModal( new Blob( [ mp4 ], { type: 'video/mp4' } ) );
 
 	} catch ( error ) {
 
 		console.error( error );
 		recording = null;
-		if ( rec.aborted !== true ) showShareModal( null );
+		updateRecButton();
 
 	}
 
@@ -700,6 +1274,7 @@ function abortRecording() {
 
 	recording = null;
 	document.getElementById( 'recBadge' ).hidden = true;
+	updateRecButton();
 
 }
 
@@ -739,110 +1314,197 @@ function closeShareModal() {
 
 }
 
-function loadToys( data, hidden = false ) {
+// community — a tiny api backs publishing and pulling public bots.
+// no accounts: a random key minted per browser marks what is yours.
 
-	restoring = true;
+function ownerKey() {
 
-	for ( const rows of data ) {
+	let key = localStorage.getItem( 'rw-key' );
 
-		addToy();
-		if ( hidden ) activeToy.visible = false;
+	if ( key === null ) {
 
-		for ( const row of rows ) {
+		key = crypto.randomUUID();
+		localStorage.setItem( 'rw-key', key );
 
-			const [ typeIndex, parentIndex, spin, x, y, z, nx, ny, nz, ...rest ] = row;
+	}
 
-			const type = TYPE_KEYS[ typeIndex ];
-			const def = TYPES[ type ];
-			const normal = new THREE.Vector3( nx, ny, nz );
+	return key;
 
-			const placement = {
-				position: new THREE.Vector3( x, y, z ),
-				quaternion: new THREE.Quaternion().setFromUnitVectors( def.mountAxis, normal ),
-				normal
-			};
+}
 
-			const piece = addPiece( type, placement, parentIndex >= 0 ? activeToy.pieces[ parentIndex ] : null );
+async function api( path, options = {} ) {
 
-			if ( def.kind === 'box' ) piece.size = { x: rest[ 0 ], y: rest[ 1 ], z: rest[ 2 ] };
-			else if ( def.kind === 'cylinder' ) piece.size = { radius: rest[ 0 ], width: rest[ 1 ] };
-			else piece.size = { radius: rest[ 0 ] };
+	const response = await fetch( path, {
+		headers: { 'Content-Type': 'application/json' },
+		signal: AbortSignal.timeout( 8000 ),
+		...options
+	} );
 
-			const sizeCount = def.kind === 'box' ? 3 : def.kind === 'cylinder' ? 2 : 1;
-			if ( rest.length >= sizeCount + 3 ) piece.pivot.set( rest[ sizeCount ], rest[ sizeCount + 1 ], rest[ sizeCount + 2 ] );
+	const body = await response.json().catch( () => ( {} ) );
+	if ( ! response.ok ) throw new Error( body.error ?? `request failed (${ response.status })` );
 
-			piece.mesh.geometry.dispose();
-			piece.mesh.geometry = buildGeometry( def, piece.size );
+	return body;
 
-			if ( spin !== 0 ) setSpin( piece, spin );
+}
+
+function showToast( text ) {
+
+	document.getElementById( 'hint' ).textContent = text;
+	clearTimeout( toastTimer );
+	toastTimer = setTimeout( updateHint, 2600 );
+
+}
+
+function openCommunity() {
+
+	document.getElementById( 'communityModal' ).hidden = false;
+	renderCommunity( commTab );
+
+}
+
+function closeCommunity() {
+
+	document.getElementById( 'communityModal' ).hidden = true;
+
+}
+
+async function renderCommunity( tab ) {
+
+	commTab = tab;
+
+	for ( const button of document.querySelectorAll( '#commTabs button' ) ) {
+
+		button.classList.toggle( 'active', button.dataset.tab === tab );
+
+	}
+
+	const list = document.getElementById( 'commList' );
+	const status = document.getElementById( 'commStatus' );
+	list.textContent = '';
+	status.textContent = 'loading…';
+
+	try {
+
+		const query = tab === 'mine' ? `?mine=1&key=${ ownerKey() }` : `?sort=${ tab }`;
+		const { robots: entries } = await api( '/api/robots' + query );
+
+		status.textContent = entries.length === 0
+			? ( tab === 'mine' ? 'nothing published yet' : 'no public bots yet — publish the first one!' )
+			: '';
+
+		for ( const entry of entries ) {
+
+			const row = document.createElement( 'div' );
+			row.className = 'comm-row';
+
+			const info = document.createElement( 'div' );
+			info.className = 'comm-info';
+
+			const name = document.createElement( 'div' );
+			name.className = 'comm-name';
+			name.textContent = entry.name;
+			info.appendChild( name );
+
+			const meta = document.createElement( 'div' );
+			meta.className = 'comm-meta';
+			const parts = Array.isArray( entry.data?.p ) ? entry.data.p.length : 0;
+			meta.textContent = `${ entry.author || 'anon' } · ${ parts } parts · ⬇ ${ entry.downloads }`;
+			info.appendChild( meta );
+
+			row.appendChild( info );
+
+			const importBtn = document.createElement( 'button' );
+			importBtn.textContent = 'Import';
+			importBtn.addEventListener( 'click', () => importCommunityBot( entry ) );
+			row.appendChild( importBtn );
+
+			if ( tab === 'mine' ) {
+
+				const delBtn = document.createElement( 'button' );
+				delBtn.className = 'danger';
+				delBtn.textContent = 'Unpublish';
+				delBtn.addEventListener( 'click', async () => {
+
+					try {
+
+						await api( `/api/robots/${ entry.id }?key=${ ownerKey() }`, { method: 'DELETE' } );
+						renderCommunity( 'mine' );
+
+					} catch ( error ) {
+
+						status.textContent = error.message;
+
+					}
+
+				} );
+				row.appendChild( delBtn );
+
+			}
+
+			list.appendChild( row );
 
 		}
 
-	}
-
-	restoring = false;
-
-	setActiveToy( toys[ 0 ] );
-
-}
-
-function loadFromHash() {
-
-	const hash = location.hash.slice( 1 );
-	if ( hash === '' ) return;
-
-	try {
-
-		loadToys( JSON.parse( atob( hash.replaceAll( '-', '+' ).replaceAll( '_', '/' ) ) ) );
-		viewingShared = true;
-
 	} catch ( error ) {
 
-		console.warn( 'could not load toys from url', error );
-
-	} finally {
-
-		restoring = false;
+		status.textContent = 'community is offline — deploy with a database to enable sharing';
 
 	}
 
 }
 
-function saveLocal() {
+function importCommunityBot( entry ) {
 
-	if ( restoring ) return;
+	const bots = loadRobots( [ entry.data ] );
+	if ( bots.length === 0 ) return;
 
-	// an edit makes the bench yours again — drop any shared-link hash
+	setActiveBot( bots[ 0 ] );
+	saveLocal();
+	updateBotsList();
+	updateBotBar();
+	closeCommunity();
+	showToast( `${ bots[ 0 ].name } rolled into the garage` );
 
-	if ( location.hash !== '' ) history.replaceState( null, '', location.pathname + location.search );
+	// count the download, best effort
 
-	try {
-
-		if ( allPieces().length > 0 ) localStorage.setItem( STORAGE_KEY, JSON.stringify( serializeToys() ) );
-		else localStorage.removeItem( STORAGE_KEY );
-
-	} catch ( error ) {
-
-		// storage unavailable — not fatal
-
-	}
+	api( `/api/robots/${ entry.id }?dl=1` ).catch( () => {} );
 
 }
 
-function loadLocal( hidden = false ) {
+async function publishActiveBot() {
+
+	if ( activeBot === null || activeBot.pieces.length === 0 ) {
+
+		document.getElementById( 'commStatus' ).textContent = 'the current robot is empty — build something first';
+		return;
+
+	}
+
+	let author = localStorage.getItem( 'rw-author' );
+
+	if ( author === null ) {
+
+		author = ( window.prompt( 'Builder name to publish under', '' ) ?? '' ).trim().slice( 0, 24 );
+		localStorage.setItem( 'rw-author', author );
+
+	}
+
+	const status = document.getElementById( 'commStatus' );
+	status.textContent = 'publishing…';
 
 	try {
 
-		const json = localStorage.getItem( STORAGE_KEY );
-		if ( json !== null ) loadToys( JSON.parse( json ), hidden );
+		await api( '/api/robots', {
+			method: 'POST',
+			body: JSON.stringify( { key: ownerKey(), name: activeBot.name, author, data: serializeBot( activeBot ) } )
+		} );
+
+		status.textContent = `${ activeBot.name } published!`;
+		renderCommunity( commTab === 'mine' ? 'mine' : 'new' );
 
 	} catch ( error ) {
 
-		console.warn( 'could not load saved toys', error );
-
-	} finally {
-
-		restoring = false;
+		status.textContent = error.message;
 
 	}
 
@@ -854,10 +1516,27 @@ function buildPalette() {
 
 	const palette = document.getElementById( 'palette' );
 
+	let weaponsLabelled = false;
+
+	const chassisLabel = document.createElement( 'div' );
+	chassisLabel.className = 'palette-label';
+	chassisLabel.textContent = 'chassis';
+	palette.appendChild( chassisLabel );
+
 	for ( const [ type, def ] of Object.entries( TYPES ) ) {
 
+		if ( def.weapon && weaponsLabelled === false ) {
+
+			const label = document.createElement( 'div' );
+			label.className = 'palette-label';
+			label.textContent = 'weapons';
+			palette.appendChild( label );
+			weaponsLabelled = true;
+
+		}
+
 		const item = document.createElement( 'div' );
-		item.className = 'piece-btn';
+		item.className = 'piece-btn' + ( def.weapon ? ' weapon' : '' );
 		item.innerHTML = `<svg viewBox="0 0 48 48">${ def.icon }</svg>${ def.name }`;
 		item.addEventListener( 'pointerdown', ( event ) => startDrag( event, type ) );
 		palette.appendChild( item );
@@ -914,33 +1593,118 @@ function bindEvents() {
 
 		setRayFromEvent( event );
 
-		if ( mode === 'play' ) {
+		if ( mode === 'battle' ) {
 
-			// click a toy to follow it, click the floor for the wide shot
+			// click a bot to follow it, click the floor for the wide shot
 
 			const hits = raycaster.intersectObjects( allPieces().map( ( p ) => p.mesh ), false );
-			focusToy = hits.length > 0 ? toyOf( hits[ 0 ].object.userData.piece ) : null;
-			updateToysList();
+			focusBot = hits.length > 0 ? botOf( hits[ 0 ].object.userData.piece ) : null;
+			updateBotsList();
 			return;
 
 		}
 
-		const hits = raycaster.intersectObjects( activeToy.pieces.map( ( p ) => p.mesh ), false );
+		const hits = raycaster.intersectObjects( activeBot.pieces.map( ( p ) => p.mesh ), false );
 		select( hits.length > 0 ? hits[ 0 ].object.userData.piece : null );
 
 	} );
 
 	document.getElementById( 'buildBtn' ).addEventListener( 'click', ( event ) => { setMode( 'build' ); event.target.blur(); } );
-	document.getElementById( 'playBtn' ).addEventListener( 'click', ( event ) => { setMode( 'play' ); event.target.blur(); } );
-	document.getElementById( 'resetBtn' ).addEventListener( 'click', ( event ) => { resetPlay(); event.target.blur(); } );
+	document.getElementById( 'battleBtn' ).addEventListener( 'click', ( event ) => { setMode( 'battle' ); event.target.blur(); } );
 	document.getElementById( 'shareBtn' ).addEventListener( 'click', ( event ) => { openShare(); event.target.blur(); } );
+	document.getElementById( 'communityBtn' ).addEventListener( 'click', ( event ) => { openCommunity(); event.target.blur(); } );
 	document.getElementById( 'closeShareBtn' ).addEventListener( 'click', closeShareModal );
+	document.getElementById( 'closeCommunityBtn' ).addEventListener( 'click', closeCommunity );
+	document.getElementById( 'publishBtn' ).addEventListener( 'click', publishActiveBot );
+
+	document.getElementById( 'samplesBtn' ).addEventListener( 'click', () => {
+
+		const bots = loadSampleBots();
+		if ( bots.length > 0 ) setActiveBot( bots[ 0 ] );
+		saveLocal();
+		closeCommunity();
+		showToast( 'sample bots rolled into the garage' );
+
+	} );
+
+	document.getElementById( 'rematchBtn' ).addEventListener( 'click', ( event ) => { resetBattle(); event.target.blur(); } );
+	document.getElementById( 'editBtn' ).addEventListener( 'click', ( event ) => { setMode( 'build' ); event.target.blur(); } );
+	document.getElementById( 'recBtn' ).addEventListener( 'click', ( event ) => { toggleRecording(); event.target.blur(); } );
+
+	document.getElementById( 'battleSeed' ).addEventListener( 'click', ( event ) => {
+
+		battleSeed = 1 + Math.floor( Math.random() * 99999 );
+		if ( battle !== null ) resetBattle();
+		event.target.blur();
+
+	} );
+
+	document.getElementById( 'botNameBtn' ).addEventListener( 'click', renameActiveBot );
+
+	const aiSelect = document.getElementById( 'botAiSelect' );
+
+	for ( const key of AI_KEYS ) {
+
+		const option = document.createElement( 'option' );
+		option.textContent = `AI: ${ AI_STYLES[ key ].name }`;
+		aiSelect.appendChild( option );
+
+	}
+
+	aiSelect.addEventListener( 'change', () => {
+
+		activeBot.ai = aiSelect.selectedIndex;
+		saveLocal();
+		aiSelect.blur();
+
+	} );
+
+	document.getElementById( 'watchBtn' ).addEventListener( 'click', () => {
+
+		document.getElementById( 'splash' ).hidden = true;
+
+		if ( serializeGarage().length === 0 ) loadSampleBots();
+
+		// stage a random pair so every first visit opens a different fight
+
+		const stocked = robots.filter( ( bot ) => bot.pieces.length > 0 );
+		const first = Math.floor( Math.random() * stocked.length );
+		let second = Math.floor( Math.random() * ( stocked.length - 1 ) );
+		if ( second >= first ) second ++;
+
+		stocked.forEach( ( bot, i ) => { bot.inBattle = ( i === first || i === second ); } );
+
+		setMode( 'battle' );
+
+	} );
+
+	document.getElementById( 'buildOwnBtn' ).addEventListener( 'click', () => {
+
+		document.getElementById( 'splash' ).hidden = true;
+
+		if ( serializeGarage().length === 0 ) loadSampleBots();
+		if ( robots.length > 0 ) setActiveBot( robots[ 0 ] );
+		updateBotsList();
+
+	} );
 
 	document.getElementById( 'shareModal' ).addEventListener( 'click', ( event ) => {
 
 		if ( event.target === event.currentTarget ) closeShareModal();
 
 	} );
+
+	document.getElementById( 'communityModal' ).addEventListener( 'click', ( event ) => {
+
+		if ( event.target === event.currentTarget ) closeCommunity();
+
+	} );
+
+	for ( const button of document.querySelectorAll( '#commTabs button' ) ) {
+
+		button.addEventListener( 'click', () => renderCommunity( button.dataset.tab ) );
+
+	}
 
 	document.getElementById( 'copyLinkBtn' ).addEventListener( 'click', ( event ) => {
 
@@ -950,6 +1714,7 @@ function bindEvents() {
 
 	} );
 	document.getElementById( 'spinBtn' ).addEventListener( 'click', cycleSpin );
+	document.getElementById( 'armorBtn' ).addEventListener( 'click', cycleArmor );
 	document.getElementById( 'duplicateBtn' ).addEventListener( 'click', duplicateSelected );
 	document.getElementById( 'deleteBtn' ).addEventListener( 'click', deleteSelected );
 
@@ -962,19 +1727,29 @@ function bindEvents() {
 
 		}
 
-		if ( event.code === 'Space' ) {
+		if ( document.getElementById( 'communityModal' ).hidden === false ) {
 
-			event.preventDefault();
-			setMode( mode === 'build' ? 'play' : 'build' );
+			if ( event.code === 'Escape' ) closeCommunity();
 			return;
 
 		}
 
-		if ( event.code === 'KeyR' && mode === 'play' ) resetPlay();
+		if ( document.getElementById( 'splash' ).hidden === false ) return;
+
+		if ( event.code === 'Space' ) {
+
+			event.preventDefault();
+			setMode( mode === 'build' ? 'battle' : 'build' );
+			return;
+
+		}
+
+		if ( event.code === 'KeyR' && mode === 'battle' ) resetBattle();
 
 		if ( mode !== 'build' ) return;
 
 		if ( event.code === 'KeyS' && selected !== null ) cycleSpin();
+		if ( event.code === 'KeyA' && selected !== null ) cycleArmor();
 		if ( event.code === 'KeyD' && selected !== null ) duplicateSelected();
 		if ( ( event.code === 'Delete' || event.code === 'Backspace' ) && selected !== null ) deleteSelected();
 
@@ -1008,6 +1783,7 @@ function updateToolbar() {
 
 		const label = selected.spin === 0 ? 'Spin: off' : selected.spin === 1 ? 'Spin: ⟳' : 'Spin: ⟲';
 		document.getElementById( 'spinBtn' ).textContent = label;
+		document.getElementById( 'armorBtn' ).textContent = `Armor: ${ ARMORS[ selected.armor ].name }`;
 
 	}
 
@@ -1017,23 +1793,23 @@ function updateHint() {
 
 	const hint = document.getElementById( 'hint' );
 
-	if ( mode === 'play' ) {
+	if ( mode === 'battle' ) {
 
-		hint.textContent = 'click a toy to focus · R — reset · space — build';
+		hint.textContent = 'click a bot to follow · R — rematch · space — build';
 
-	} else if ( activeToy === null || activeToy.pieces.length === 0 ) {
+	} else if ( activeBot === null || activeBot.pieces.length === 0 ) {
 
-		hint.textContent = 'drag a piece onto the floor to start a toy';
+		hint.textContent = 'drag a piece onto the floor to start a robot — weapons that spin do the damage';
 
 	} else if ( selected !== null ) {
 
 		hint.textContent = selected.spin !== 0
-			? 'drag the pin to move the spin axis · handles resize · S — spin · delete — remove'
-			: 'drag the orange handles to resize · S — spin · delete — remove · space — play';
+			? 'drag the pin to move the spin axis · handles resize · A — armor · S — spin · delete — remove'
+			: 'drag the orange handles to resize · A — armor · S — spin · delete — remove · space — battle';
 
 	} else {
 
-		hint.textContent = 'drag palette pieces to add · drag toy pieces to move · space — play';
+		hint.textContent = 'drag palette pieces to add · drag bot pieces to move · space — battle';
 
 	}
 
@@ -1079,8 +1855,9 @@ function mountDepthFor( piece ) {
 
 	const def = TYPES[ piece.type ];
 
-	if ( def.kind === 'box' ) return piece.size.y / 2;
+	if ( def.kind === 'box' || def.kind === 'wedge' ) return piece.size.y / 2;
 	if ( def.kind === 'cylinder' ) return piece.size.width / 2;
+	if ( def.kind === 'cone' ) return piece.size.height / 2;
 
 	return piece.size.radius;
 
@@ -1127,9 +1904,9 @@ function onDragMove( event ) {
 	drag.placement = null;
 	drag.parent = null;
 
-	if ( activeToy.pieces.length > 0 ) {
+	if ( activeBot.pieces.length > 0 ) {
 
-		const hits = raycaster.intersectObjects( activeToy.pieces.map( ( p ) => p.mesh ), false );
+		const hits = raycaster.intersectObjects( activeBot.pieces.map( ( p ) => p.mesh ), false );
 
 		if ( hits.length > 0 ) {
 
@@ -1148,9 +1925,9 @@ function onDragMove( event ) {
 
 	}
 
-	// the floor only accepts the first piece of a toy — new toys start from the list
+	// the floor only accepts the first piece of a bot — new bots start from the list
 
-	drag.valid = drag.placement !== null && ( activeToy.pieces.length === 0 || drag.parent !== null );
+	drag.valid = drag.placement !== null && ( activeBot.pieces.length === 0 || drag.parent !== null );
 
 	if ( drag.placement !== null ) {
 
@@ -1188,19 +1965,20 @@ function onDragEnd( event ) {
 
 }
 
-function addPiece( type, placement, parent ) {
+function addPiece( type, placement, parent, armor ) {
 
 	const def = TYPES[ type ];
 	const size = { ...def.defaultSize };
+	armor = armor ?? def.defaultArmor;
 
-	const mesh = new THREE.Mesh( buildGeometry( def, size ), def.material );
+	const mesh = new THREE.Mesh( buildGeometry( def, size ), materialFor( type, armor ) );
 	mesh.castShadow = true;
 	mesh.receiveShadow = true;
 	mesh.position.copy( placement.position );
 	mesh.quaternion.copy( placement.quaternion );
 
 	const piece = {
-		type, mesh, parent, size,
+		type, mesh, parent, size, armor,
 		spin: 0,
 		pivot: new THREE.Vector3(), // spin axis offset, local, ⊥ mount axis
 		position: placement.position.clone(),
@@ -1210,23 +1988,24 @@ function addPiece( type, placement, parent ) {
 	};
 
 	mesh.userData.piece = piece;
-	activeToy.pieces.push( piece );
+	activeBot.pieces.push( piece );
 	scene.add( mesh );
 
-	updateToysList();
+	updateBotsList();
+	updateBotBar();
 	saveLocal();
 
 	return piece;
 
 }
 
-function collectSubtree( piece ) {
+function collectSubtree( piece, bot = activeBot ) {
 
 	const list = [ piece ];
 
-	for ( const other of activeToy.pieces ) {
+	for ( const other of bot.pieces ) {
 
-		if ( other.parent === piece ) list.push( ...collectSubtree( other ) );
+		if ( other.parent === piece ) list.push( ...collectSubtree( other, bot ) );
 
 	}
 
@@ -1263,11 +2042,27 @@ function cycleSpin() {
 
 }
 
+function cycleArmor() {
+
+	if ( selected === null ) return;
+
+	const next = ARMOR_KEYS[ ( ARMOR_KEYS.indexOf( selected.armor ) + 1 ) % ARMOR_KEYS.length ];
+	selected.armor = next;
+	selected.mesh.material = materialFor( selected.type, next );
+
+	updateToolbar();
+	updateBotBar();
+	updateBotsList();
+	saveLocal();
+
+}
+
 function ringRadiusFor( piece ) {
 
 	const size = piece.size;
+	const kind = TYPES[ piece.type ].kind;
 
-	if ( TYPES[ piece.type ].kind === 'box' ) return Math.max( size.x, size.z ) / 2 + 0.08;
+	if ( kind === 'box' || kind === 'wedge' ) return Math.max( size.x, size.z ) / 2 + 0.08;
 
 	return size.radius + 0.08;
 
@@ -1324,7 +2119,7 @@ function setSpin( piece, spin ) {
 
 function clonePiece( old, parent, placement, spin, pivot ) {
 
-	const piece = addPiece( old.type, placement, parent );
+	const piece = addPiece( old.type, placement, parent, old.armor );
 
 	piece.size = { ...old.size };
 	piece.pivot.copy( pivot );
@@ -1346,10 +2141,14 @@ function duplicateSelected() {
 
 	if ( selected.parent === null ) {
 
-		// duplicating the root copies the whole toy into a new slot
+		// duplicating the root copies the whole bot into a new slot
 
 		const original = selected;
-		addToy();
+		const oldName = activeBot.name;
+		const oldAi = activeBot.ai;
+		const bot = addBot();
+		bot.name = `${ oldName } II`.slice( 0, 24 );
+		bot.ai = oldAi;
 
 		for ( const old of source ) {
 
@@ -1363,6 +2162,7 @@ function duplicateSelected() {
 
 		}
 
+		updateBotBar();
 		select( cloneOf.get( original ) );
 
 	} else {
@@ -1417,10 +2217,11 @@ function deleteSelected() {
 
 	for ( const piece of doomed ) destroyPiece( piece );
 
-	activeToy.pieces = activeToy.pieces.filter( ( piece ) => ! doomed.has( piece ) );
+	activeBot.pieces = activeBot.pieces.filter( ( piece ) => ! doomed.has( piece ) );
 
 	select( null );
-	updateToysList();
+	updateBotsList();
+	updateBotBar();
 	saveLocal();
 	updateHint();
 
@@ -1430,8 +2231,11 @@ function deleteSelected() {
 
 function resizeKindFor( type, dirLocal ) {
 
-	if ( type === 'ball' ) return 'radius';
-	if ( type === 'wheel' ) return Math.abs( dirLocal.z ) > 0.5 ? 'width' : 'radius';
+	const kind = TYPES[ type ].kind;
+
+	if ( kind === 'sphere' ) return 'radius';
+	if ( kind === 'cylinder' ) return Math.abs( dirLocal.z ) > 0.5 ? 'width' : 'radius';
+	if ( kind === 'cone' ) return Math.abs( dirLocal.y ) > 0.5 ? 'height' : 'radius';
 
 	return Math.abs( dirLocal.x ) > 0.5 ? 'x' : Math.abs( dirLocal.y ) > 0.5 ? 'y' : 'z';
 
@@ -1444,6 +2248,7 @@ function handleOffsetFor( piece, dirLocal ) {
 
 	if ( kind === 'radius' ) return piece.size.radius + margin;
 	if ( kind === 'width' ) return piece.size.width / 2 + margin;
+	if ( kind === 'height' ) return piece.size.height / 2 + margin;
 
 	return piece.size[ kind ] / 2 + margin;
 
@@ -1509,12 +2314,13 @@ function clampResizeDelta( piece, kind, delta ) {
 
 	if ( kind === 'radius' ) {
 
-		const max = piece.type === 'wheel' ? 1.0 : 0.9;
+		const max = piece.type === 'wheel' ? 1.0 : piece.type === 'saw' ? 0.6 : piece.type === 'mace' ? 0.4 : 0.9;
 		return THREE.MathUtils.clamp( delta, 0.08 - size0.radius, max - size0.radius );
 
 	}
 
 	if ( kind === 'width' ) return THREE.MathUtils.clamp( delta, 0.06 - size0.width, 0.9 - size0.width );
+	if ( kind === 'height' ) return THREE.MathUtils.clamp( delta, 0.15 - size0.height, 0.8 - size0.height );
 
 	return THREE.MathUtils.clamp( delta, 0.1 - size0[ kind ], 2.5 - size0[ kind ] );
 
@@ -1543,23 +2349,23 @@ function onResizeStart( event ) {
 	// children attached to a moving face ride along with it
 
 	const moved = [];
-	const axisWorld = piece.type === 'wheel' ? Z_AXIS.clone().applyQuaternion( piece.quaternion ) : null;
+	const axisWorld = TYPES[ piece.type ].kind === 'cylinder' ? Z_AXIS.clone().applyQuaternion( piece.quaternion ) : null;
 
-	for ( const child of activeToy.pieces ) {
+	for ( const child of activeBot.pieces ) {
 
 		if ( child.parent !== piece ) continue;
 
 		let shiftDir = null;
 
-		if ( kind === 'x' || kind === 'y' || kind === 'z' || kind === 'width' ) {
+		if ( kind === 'x' || kind === 'y' || kind === 'z' || kind === 'width' || kind === 'height' ) {
 
 			if ( child.attachNormal.dot( dirWorld ) > 0.9 ) shiftDir = dirWorld;
 
-		} else if ( piece.type === 'ball' ) {
+		} else if ( TYPES[ piece.type ].kind === 'sphere' ) {
 
 			shiftDir = child.attachNormal;
 
-		} else if ( Math.abs( child.attachNormal.dot( axisWorld ) ) < 0.5 ) {
+		} else if ( axisWorld !== null && Math.abs( child.attachNormal.dot( axisWorld ) ) < 0.5 ) {
 
 			shiftDir = child.attachNormal;
 
@@ -1622,6 +2428,7 @@ function applyResize( delta ) {
 		// one face moves, the opposite face stays put
 
 		if ( kind === 'width' ) piece.size.width = size0.width + delta;
+		else if ( kind === 'height' ) piece.size.height = size0.height + delta;
 		else piece.size[ kind ] = size0[ kind ] + delta;
 
 		piece.position.copy( pos0 ).addScaledVector( dirWorld, delta / 2 );
@@ -1729,7 +2536,7 @@ function cancelPivotDrag() {
 
 }
 
-// moving pieces — drag a piece to re-attach it (or the root to move the toy)
+// moving pieces — drag a piece to re-attach it (or the root to move the bot)
 
 function onMoveStart( event ) {
 
@@ -1737,7 +2544,7 @@ function onMoveStart( event ) {
 	if ( event.button !== 0 ) return; // right-drag on a piece still pans
 
 	setRayFromEvent( event );
-	const hits = raycaster.intersectObjects( activeToy.pieces.map( ( p ) => p.mesh ), false );
+	const hits = raycaster.intersectObjects( activeBot.pieces.map( ( p ) => p.mesh ), false );
 	if ( hits.length === 0 ) return;
 
 	event.stopPropagation();
@@ -1806,7 +2613,7 @@ function onMoveMove( event ) {
 
 		// a child re-attaches to any piece outside its own subtree
 
-		const targets = activeToy.pieces.filter( ( p ) => ! subtreeSet.has( p ) ).map( ( p ) => p.mesh );
+		const targets = activeBot.pieces.filter( ( p ) => ! subtreeSet.has( p ) ).map( ( p ) => p.mesh );
 		const hits = raycaster.intersectObjects( targets, false );
 
 		if ( hits.length > 0 ) {
@@ -1829,7 +2636,7 @@ function onMoveMove( event ) {
 
 	} else if ( raycaster.ray.intersectPlane( groundPlane, _v1 ) !== null ) {
 
-		// the root slides across the floor, taking the whole toy with it
+		// the root slides across the floor, taking the whole bot with it
 
 		_q1.setFromUnitVectors( def.mountAxis, Y_AXIS );
 		_v2.copy( moveDrag.grabOffset ).applyQuaternion( _q1 );
@@ -1940,11 +2747,13 @@ function cancelResize() {
 	resize = null;
 	document.body.style.cursor = '';
 
+	updateBotBar();
+	updateBotsList();
 	saveLocal();
 
 }
 
-// audio — synthesised wood knocks for contact hits
+// audio — synthesised knocks, clangs and crunches for the fight
 
 function initAudio() {
 
@@ -1978,12 +2787,27 @@ function initAudio() {
 
 }
 
-// inharmonic mode ratios of a struck wooden bar, and their relative weights
+function panForPoint( point ) {
+
+	if ( audio === null ) return null;
+
+	const pan = audio.ctx.createStereoPanner();
+	_v1.set( point.x, point.y, point.z ).project( camera );
+	pan.pan.value = THREE.MathUtils.clamp( _v1.x, - 0.8, 0.8 );
+	pan.connect( audio.master );
+
+	return pan;
+
+}
+
+// inharmonic mode ratios of a struck bar — wood dies fast, metal rings
 
 const KNOCK_RATIOS = [ 1, 2.42, 3.83, 5.11 ];
 const KNOCK_GAINS = [ 1, 0.45, 0.24, 0.12 ];
+const CLANG_RATIOS = [ 1, 2.76, 5.4, 8.93 ];
+const CLANG_GAINS = [ 1, 0.6, 0.35, 0.18 ];
 
-function playKnock( point, speed ) {
+function playHit( point, speed, metal ) {
 
 	if ( audio === null || audio.ctx.state !== 'running' ) return;
 
@@ -1991,23 +2815,21 @@ function playKnock( point, speed ) {
 	const time = ctx.currentTime;
 
 	const strength = Math.min( speed / 6, 1 ) ** 2;
-	const frequency = 160 + Math.random() * 180; // every knock its own tone
+	const ratios = metal ? CLANG_RATIOS : KNOCK_RATIOS;
+	const gains = metal ? CLANG_GAINS : KNOCK_GAINS;
+	const frequency = metal ? 380 + Math.random() * 320 : 160 + Math.random() * 180;
+	const baseDecay = metal ? 0.22 : 0.07;
 
-	// pan by where the hit sits on screen
-
-	const pan = ctx.createStereoPanner();
-	_v1.set( point.x, point.y, point.z ).project( camera );
-	pan.pan.value = THREE.MathUtils.clamp( _v1.x, - 0.8, 0.8 );
-	pan.connect( audio.master );
+	const pan = panForPoint( point );
 
 	// modal ring: inharmonic partials, each dying at its own rate,
 	// the higher ones only waking up on harder hits
 
-	for ( let i = 0; i < KNOCK_RATIOS.length; i ++ ) {
+	for ( let i = 0; i < ratios.length; i ++ ) {
 
 		const brightness = i === 0 ? 1 : 0.35 + 0.65 * strength;
-		const amplitude = 0.55 * strength * KNOCK_GAINS[ i ] * brightness;
-		const decay = 0.07 * ( 1 + strength * 0.6 ) / ( 1 + i * 0.8 );
+		const amplitude = 0.55 * strength * gains[ i ] * brightness;
+		const decay = baseDecay * ( 1 + strength * 0.6 ) / ( 1 + i * 0.8 );
 
 		const gain = ctx.createGain();
 		gain.gain.setValueAtTime( amplitude, time );
@@ -2015,7 +2837,7 @@ function playKnock( point, speed ) {
 		gain.connect( pan );
 
 		const osc = ctx.createOscillator();
-		osc.frequency.value = frequency * KNOCK_RATIOS[ i ] * ( 0.98 + Math.random() * 0.04 );
+		osc.frequency.value = frequency * ratios[ i ] * ( 0.98 + Math.random() * 0.04 );
 		osc.connect( gain );
 		osc.start( time );
 		osc.stop( time + decay + 0.02 );
@@ -2054,56 +2876,318 @@ function playKnock( point, speed ) {
 
 }
 
-// play mode
+function playCrunch( point ) {
 
-function setMode( next ) {
+	if ( audio === null || audio.ctx.state !== 'running' ) return;
 
-	if ( next === mode ) return;
+	const ctx = audio.ctx;
+	const time = ctx.currentTime;
+	const pan = panForPoint( point );
 
-	cancelResize();
-	cancelPivotDrag();
-	cancelMoveDrag();
-	abortRecording();
+	// splintering: a burst of low noise plus a couple of dying knocks
 
-	if ( next === 'play' ) {
+	const gain = ctx.createGain();
+	gain.gain.setValueAtTime( 0.7, time );
+	gain.gain.exponentialRampToValueAtTime( 0.001, time + 0.22 );
 
-		select( null );
-		initAudio(); // mode switches are user gestures, so this is allowed
-		enterPlay();
+	const filter = ctx.createBiquadFilter();
+	filter.type = 'lowpass';
+	filter.frequency.setValueAtTime( 1600, time );
+	filter.frequency.exponentialRampToValueAtTime( 300, time + 0.2 );
 
-	} else {
+	for ( let i = 0; i < 3; i ++ ) {
 
-		exitPlay();
-
-	}
-
-	mode = next;
-	focusToy = null;
-
-	document.body.classList.toggle( 'play', mode === 'play' );
-	document.getElementById( 'buildBtn' ).classList.toggle( 'active', mode === 'build' );
-	document.getElementById( 'playBtn' ).classList.toggle( 'active', mode === 'play' );
-
-	refreshVisibility();
-	updateToysList();
-
-	for ( const piece of allPieces() ) {
-
-		if ( piece.indicator !== null ) piece.indicator.root.visible = mode === 'build';
+		const src = ctx.createBufferSource();
+		src.buffer = audio.noise;
+		src.playbackRate.value = 0.5 + Math.random();
+		src.loop = true;
+		src.connect( filter );
+		src.start( time + i * 0.03 );
+		src.stop( time + 0.25 );
 
 	}
 
-	updateToolbar();
-	updateHint();
+	filter.connect( gain ).connect( pan );
 
 }
 
+function playHorn() {
+
+	if ( audio === null || audio.ctx.state !== 'running' ) return;
+
+	const ctx = audio.ctx;
+	const time = ctx.currentTime;
+
+	// the end-of-fight klaxon — two detuned squares through a lowpass
+
+	const gain = ctx.createGain();
+	gain.gain.setValueAtTime( 0.0001, time );
+	gain.gain.exponentialRampToValueAtTime( 0.35, time + 0.03 );
+	gain.gain.setValueAtTime( 0.35, time + 0.55 );
+	gain.gain.exponentialRampToValueAtTime( 0.001, time + 0.85 );
+
+	const filter = ctx.createBiquadFilter();
+	filter.type = 'lowpass';
+	filter.frequency.value = 900;
+	filter.connect( gain );
+	gain.connect( audio.master );
+
+	for ( const freq of [ 220, 277 ] ) {
+
+		const osc = ctx.createOscillator();
+		osc.type = 'square';
+		osc.frequency.value = freq;
+		osc.connect( filter );
+		osc.start( time );
+		osc.stop( time + 0.9 );
+
+	}
+
+}
+
+// particles — one pool of unlit chips for sparks / splinters / flames,
+// one pool of soft spheres for smoke
+
+let solidPool = null;
+let smokePool = null;
+
+const _pv = new THREE.Vector3();
+const _pv2 = new THREE.Vector3();
+const _pq = new THREE.Quaternion();
+const _pm = new THREE.Matrix4();
+const _pc = new THREE.Color();
+const ZERO_MATRIX = new THREE.Matrix4().makeScale( 0, 0, 0 );
+
+function makePool( count, geometry, material ) {
+
+	const mesh = new THREE.InstancedMesh( geometry, material, count );
+	mesh.instanceMatrix.setUsage( THREE.DynamicDrawUsage );
+	mesh.frustumCulled = false;
+
+	const white = new THREE.Color( 0xffffff );
+
+	for ( let i = 0; i < count; i ++ ) {
+
+		mesh.setMatrixAt( i, ZERO_MATRIX );
+		mesh.setColorAt( i, white );
+
+	}
+
+	scene.add( mesh );
+
+	const items = [];
+
+	for ( let i = 0; i < count; i ++ ) {
+
+		items.push( {
+			life: 0, maxLife: 1,
+			pos: new THREE.Vector3(), vel: new THREE.Vector3(),
+			size: 0.03, gravity: 0, grow: 0, spin: 0, angle: 0,
+			colorFrom: new THREE.Color(), colorTo: new THREE.Color()
+		} );
+
+	}
+
+	return { mesh, items, count, cursor: 0 };
+
+}
+
+function initParticles() {
+
+	solidPool = makePool( 500, new THREE.BoxGeometry( 1, 1, 1 ), new THREE.MeshBasicMaterial( { toneMapped: false } ) );
+	smokePool = makePool( 160, new THREE.SphereGeometry( 1, 8, 6 ), new THREE.MeshStandardMaterial( { transparent: true, opacity: 0.3, roughness: 1, depthWrite: false } ) );
+
+}
+
+function spawnParticle( pool, options ) {
+
+	const item = pool.items[ pool.cursor ];
+	pool.cursor = ( pool.cursor + 1 ) % pool.count;
+
+	item.life = item.maxLife = options.life;
+	item.pos.copy( options.pos );
+	item.vel.copy( options.vel );
+	item.size = options.size;
+	item.gravity = options.gravity ?? 0;
+	item.grow = options.grow ?? 0; // negative shrinks over life, positive grows
+	item.spin = options.spin ?? 0;
+	item.angle = Math.random() * Math.PI * 2;
+	item.colorFrom.set( options.colorFrom );
+	item.colorTo.set( options.colorTo ?? options.colorFrom );
+
+}
+
+function updatePool( pool, dt ) {
+
+	const mesh = pool.mesh;
+
+	for ( let i = 0; i < pool.count; i ++ ) {
+
+		const item = pool.items[ i ];
+
+		if ( item.life <= 0 ) continue;
+
+		item.life -= dt;
+
+		if ( item.life <= 0 ) {
+
+			mesh.setMatrixAt( i, ZERO_MATRIX );
+			continue;
+
+		}
+
+		item.vel.y += item.gravity * dt;
+		item.pos.addScaledVector( item.vel, dt );
+		item.angle += item.spin * dt;
+
+		const t = 1 - item.life / item.maxLife; // 0 → 1 over the particle's life
+		const scale = item.size * Math.max( 1 + item.grow * t, 0.01 );
+
+		_pq.setFromAxisAngle( Y_AXIS, item.angle );
+		_pm.compose( item.pos, _pq, _pv.set( scale, scale, scale ) );
+		mesh.setMatrixAt( i, _pm );
+
+		_pc.copy( item.colorFrom ).lerp( item.colorTo, t );
+		mesh.setColorAt( i, _pc );
+
+	}
+
+	mesh.instanceMatrix.needsUpdate = true;
+	if ( mesh.instanceColor !== null ) mesh.instanceColor.needsUpdate = true;
+
+}
+
+function updateParticles( dt ) {
+
+	if ( solidPool === null ) return;
+
+	updatePool( solidPool, dt );
+	updatePool( smokePool, dt );
+
+}
+
+function clearParticles() {
+
+	if ( solidPool === null ) return;
+
+	for ( const pool of [ solidPool, smokePool ] ) {
+
+		for ( let i = 0; i < pool.count; i ++ ) {
+
+			pool.items[ i ].life = 0;
+			pool.mesh.setMatrixAt( i, ZERO_MATRIX );
+
+		}
+
+		pool.mesh.instanceMatrix.needsUpdate = true;
+
+	}
+
+}
+
+function emitSparks( point, count, metal ) {
+
+	for ( let i = 0; i < count; i ++ ) {
+
+		_pv.set( Math.random() - 0.5, Math.random() * 0.8, Math.random() - 0.5 ).normalize().multiplyScalar( 1.5 + Math.random() * 3.5 );
+
+		spawnParticle( solidPool, {
+			pos: point, vel: _pv,
+			life: 0.25 + Math.random() * 0.4,
+			size: metal ? 0.02 + Math.random() * 0.02 : 0.03 + Math.random() * 0.025,
+			gravity: - 9,
+			grow: - 0.7,
+			spin: ( Math.random() - 0.5 ) * 20,
+			colorFrom: metal ? 0xffe08a : 0xa07a4c,
+			colorTo: metal ? 0xff5a2a : 0x5c4326
+		} );
+
+	}
+
+}
+
+function emitFlame( point ) {
+
+	_pv.set( ( Math.random() - 0.5 ) * 0.4, 0.7 + Math.random() * 0.7, ( Math.random() - 0.5 ) * 0.4 );
+
+	spawnParticle( solidPool, {
+		pos: point, vel: _pv,
+		life: 0.3 + Math.random() * 0.3,
+		size: 0.05 + Math.random() * 0.04,
+		gravity: 0,
+		grow: - 0.85,
+		spin: ( Math.random() - 0.5 ) * 8,
+		colorFrom: 0xffb347,
+		colorTo: 0xe23c1e
+	} );
+
+}
+
+function emitSmoke( point ) {
+
+	_pv.set( ( Math.random() - 0.5 ) * 0.3, 0.5 + Math.random() * 0.4, ( Math.random() - 0.5 ) * 0.3 );
+
+	const shade = 0.35 + Math.random() * 0.3;
+	_pc.setRGB( shade, shade, shade );
+
+	spawnParticle( smokePool, {
+		pos: point, vel: _pv,
+		life: 1.0 + Math.random() * 0.8,
+		size: 0.04 + Math.random() * 0.03,
+		gravity: 0.1,
+		grow: 2.2,
+		colorFrom: _pc.getHex(),
+		colorTo: 0xbbbbbb
+	} );
+
+}
+
+function emitExplosion( point, big ) {
+
+	emitSparks( point, big ? 36 : 16, true );
+	emitSparks( point, big ? 14 : 6, false );
+
+	for ( let i = 0; i < ( big ? 8 : 4 ); i ++ ) {
+
+		// not _pv — emitSmoke claims that one for its velocity
+
+		_pv2.copy( point );
+		_pv2.x += ( Math.random() - 0.5 ) * 0.3;
+		_pv2.z += ( Math.random() - 0.5 ) * 0.3;
+		emitSmoke( _pv2 );
+
+	}
+
+}
+
+function emitConfetti( point ) {
+
+	for ( let i = 0; i < 60; i ++ ) {
+
+		_pv.set( Math.random() - 0.5, Math.random() * 1.4 + 0.6, Math.random() - 0.5 ).normalize().multiplyScalar( 2.5 + Math.random() * 3 );
+		_pc.setHSL( Math.random(), 0.85, 0.6 );
+
+		spawnParticle( solidPool, {
+			pos: point, vel: _pv,
+			life: 0.9 + Math.random() * 0.9,
+			size: 0.035,
+			gravity: - 3.5,
+			spin: ( Math.random() - 0.5 ) * 25,
+			colorFrom: _pc.getHex()
+		} );
+
+	}
+
+}
+
+// battle mode
+
 function colliderLocalPoints( piece ) {
 
-	const kind = TYPES[ piece.type ].kind;
+	const def = TYPES[ piece.type ];
 	const points = [];
 
-	if ( kind === 'box' ) {
+	if ( def.kind === 'box' ) {
 
 		const hx = piece.size.x / 2, hy = piece.size.y / 2, hz = piece.size.z / 2;
 
@@ -2112,7 +3196,34 @@ function colliderLocalPoints( piece ) {
 				for ( const sz of [ - 1, 1 ] )
 					points.push( new THREE.Vector3( sx * hx, sy * hy, sz * hz ) );
 
-	} else if ( kind === 'cylinder' ) {
+	} else if ( def.kind === 'wedge' ) {
+
+		const hx = piece.size.x / 2, hy = piece.size.y / 2, hz = piece.size.z / 2;
+
+		for ( const sz of [ - 1, 1 ] ) {
+
+			points.push(
+				new THREE.Vector3( - hx, - hy, sz * hz ),
+				new THREE.Vector3( hx, - hy, sz * hz ),
+				new THREE.Vector3( - hx, hy, sz * hz )
+			);
+
+		}
+
+	} else if ( def.kind === 'cone' ) {
+
+		const radius = piece.size.radius, hh = piece.size.height / 2;
+
+		for ( let i = 0; i < 8; i ++ ) {
+
+			const angle = ( i / 8 ) * Math.PI * 2;
+			points.push( new THREE.Vector3( Math.cos( angle ) * radius, - hh, Math.sin( angle ) * radius ) );
+
+		}
+
+		points.push( new THREE.Vector3( 0, hh, 0 ) );
+
+	} else if ( def.kind === 'cylinder' ) {
 
 		const radius = piece.size.radius, halfWidth = piece.size.width / 2;
 
@@ -2148,11 +3259,11 @@ function pieceMinY( piece ) {
 
 }
 
-function toyBoundsXZ( toy ) {
+function botBoundsXZ( bot ) {
 
 	let minX = Infinity, maxX = - Infinity, minZ = Infinity, maxZ = - Infinity;
 
-	for ( const piece of toy.pieces ) {
+	for ( const piece of bot.pieces ) {
 
 		if ( TYPES[ piece.type ].kind === 'sphere' ) {
 
@@ -2182,19 +3293,25 @@ function toyBoundsXZ( toy ) {
 
 }
 
+function shapeKey( shapeId ) {
+
+	return `${ shapeId.index1 }:${ shapeId.generation }`;
+
+}
+
 function addCollider( body, piece, origin, lift, offset ) {
 
 	const def = TYPES[ piece.type ];
 
 	const shapeDef = b3.b3DefaultShapeDef();
-	shapeDef.density = DENSITY;
+	shapeDef.density = DENSITY * ARMORS[ piece.armor ].density;
 	shapeDef.enableHitEvents = true;
 	shapeDef.baseMaterial.friction = def.friction;
 	shapeDef.baseMaterial.restitution = def.restitution;
 
 	if ( def.kind === 'sphere' ) {
 
-		b3.b3CreateSphereShape( body, shapeDef, {
+		return b3.b3CreateSphereShape( body, shapeDef, {
 			center: {
 				x: piece.position.x + offset.x - origin.x,
 				y: piece.position.y + lift - origin.y,
@@ -2202,8 +3319,6 @@ function addCollider( body, piece, origin, lift, offset ) {
 			},
 			radius: piece.size.radius
 		} );
-
-		return;
 
 	}
 
@@ -2217,8 +3332,10 @@ function addCollider( body, piece, origin, lift, offset ) {
 	}
 
 	const hull = b3.b3CreateHull( flat );
-	b3.b3CreateHullShape( body, shapeDef, hull );
+	const shapeId = b3.b3CreateHullShape( body, shapeDef, hull );
 	hull.delete();
+
+	return shapeId;
 
 }
 
@@ -2237,7 +3354,25 @@ function spinRootOf( piece ) {
 
 }
 
-function toyRootOf( piece ) {
+// in battle, wheels split off as their own hinged bodies too — a chassis
+// on wheels rolls instead of scraping
+
+function driveRootOf( piece ) {
+
+	let p = piece;
+
+	while ( p !== null ) {
+
+		if ( p.spin !== 0 || p.type === 'wheel' ) return p;
+		p = p.parent;
+
+	}
+
+	return null;
+
+}
+
+function rootPieceOf( piece ) {
 
 	let p = piece;
 
@@ -2247,95 +3382,177 @@ function toyRootOf( piece ) {
 
 }
 
-function enterPlay() {
+// the arena — an octagon of wooden walls on the workshop floor, with a
+// strip of spikes on two sides. thrown over the wall = out of the arena.
 
-	const worldDef = b3.b3DefaultWorldDef();
-	worldDef.gravity = { x: 0, y: - 9.81, z: 0 };
-	worldDef.hitEventThreshold = 0.6; // m/s of approach before a knock
-	const world = b3.b3CreateWorld( worldDef );
+function buildArena( world ) {
 
-	const groundDef = b3.b3DefaultBodyDef();
-	groundDef.position = { x: 0, y: - 0.51, z: 0 };
-	const groundBody = b3.b3CreateBody( world, groundDef );
-	const groundShape = b3.b3DefaultShapeDef();
-	groundShape.enableHitEvents = true;
-	groundShape.baseMaterial.friction = 0.9;
-	b3.b3CreateBoxShape( groundBody, groundShape, 60, 0.5, 60 ); // safety net under the cup
+	const group = new THREE.Group();
 
-	const cupDef = b3.b3DefaultBodyDef();
-	const cupBody = b3.b3CreateBody( world, cupDef );
-	b3.b3CreateMeshShape( cupBody, groundShape, groundMesh, { x: 1, y: 1, z: 1 } );
+	// a painted plate marks the fight zone; thin enough that wheels
+	// resting on the real floor do not visibly sink into it
 
-	const played = toys.filter( ( toy ) => toy.pieces.length > 0 && toy.visible );
+	const plate = new THREE.Mesh( new THREE.CylinderGeometry( 6.7, 6.7, 0.012, 8 ), arenaFloorMaterial );
+	plate.rotation.y = Math.PI / 8;
+	plate.position.y = 0.006;
+	plate.receiveShadow = true;
+	group.add( plate );
 
-	// several toys play side by side; a single toy stays where it was built
+	const arenaBody = b3.b3CreateBody( world, b3.b3DefaultBodyDef() );
 
-	const offsets = new Map();
+	const wallShapeDef = b3.b3DefaultShapeDef();
+	wallShapeDef.enableHitEvents = true;
+	wallShapeDef.baseMaterial.friction = 0.5;
+	wallShapeDef.baseMaterial.restitution = 0.15;
 
-	if ( played.length > 1 ) {
+	const segmentLength = 2 * ARENA_APOTHEM * Math.tan( Math.PI / 8 ) + 0.12;
+	const wallGeometry = new THREE.BoxGeometry( 0.22, WALL_HEIGHT, segmentLength );
+	const spikeGeometry = new THREE.ConeGeometry( 0.07, 0.3, 10 );
+	const postGeometry = new THREE.CylinderGeometry( 0.07, 0.09, 1.0, 10 );
 
-		const bounds = played.map( ( toy ) => toyBoundsXZ( toy ) );
+	for ( let k = 0; k < 8; k ++ ) {
 
-		let total = TOY_GAP * ( played.length - 1 );
-		for ( const b of bounds ) total += b.maxX - b.minX;
+		const angle = k * Math.PI / 4;
+		const cos = Math.cos( angle ), sin = Math.sin( angle );
+		const hazard = k === 2 || k === 6; // the ±z walls bite
 
-		let cursor = - total / 2;
+		const cx = cos * ( ARENA_APOTHEM + 0.11 );
+		const cz = sin * ( ARENA_APOTHEM + 0.11 );
 
-		played.forEach( ( toy, i ) => {
+		const wall = new THREE.Mesh( wallGeometry, hazard ? arenaHazardMaterial : arenaWallMaterial );
+		wall.position.set( cx, WALL_HEIGHT / 2, cz );
+		wall.rotation.y = - angle;
+		wall.castShadow = true;
+		wall.receiveShadow = true;
+		group.add( wall );
 
-			const b = bounds[ i ];
-			const width = b.maxX - b.minX;
-			offsets.set( toy, new THREE.Vector3( cursor + width / 2 - ( b.minX + b.maxX ) / 2, 0, - ( b.minZ + b.maxZ ) / 2 ) );
-			cursor += width + TOY_GAP;
+		// physics: the wall as a hull of its eight rotated corners
 
-		} );
+		const flat = [];
 
-	} else if ( played.length === 1 ) {
+		for ( const sx of [ - 0.11, 0.11 ] )
+			for ( const sy of [ 0.01, WALL_HEIGHT ] )
+				for ( const sz of [ - segmentLength / 2, segmentLength / 2 ] )
+					flat.push( cx + sx * cos - sz * sin, sy, cz + sx * sin + sz * cos );
 
-		offsets.set( played[ 0 ], new THREE.Vector3() );
+		const hull = b3.b3CreateHull( flat );
+		const shapeId = b3.b3CreateHullShape( arenaBody, wallShapeDef, hull );
+		hull.delete();
 
-	}
+		if ( hazard ) {
 
-	// drop the toys from a touch above the floor
+			battle.shapeMap.set( shapeKey( shapeId ), { hazard: true } );
 
-	let minY = Infinity;
-	for ( const toy of played ) for ( const piece of toy.pieces ) minY = Math.min( minY, pieceMinY( piece ) );
-	const lift = played.length > 0 ? 0.02 - Math.min( minY, 0.02 ) : 0;
+			// a row of spikes pointing back into the arena
 
-	// each toy's rigid assembly becomes one body; every spinning piece (plus
-	// anything built onto it) becomes its own body, joined by a motorised hinge
+			for ( let j = - 2; j <= 2; j ++ ) {
 
-	const groups = new Map();
+				const spike = new THREE.Mesh( spikeGeometry, METALS.steel );
+				const along = j * 0.85;
+				spike.position.set(
+					cx - cos * 0.23 - sin * along,
+					0.35,
+					cz - sin * 0.23 + cos * along
+				);
+				spike.quaternion.setFromUnitVectors( Y_AXIS, _v1.set( - cos, 0, - sin ) );
+				spike.castShadow = true;
+				group.add( spike );
 
-	for ( const toy of played ) {
-
-		for ( const piece of toy.pieces ) {
-
-			const key = spinRootOf( piece ) ?? toyRootOf( piece );
-			if ( ! groups.has( key ) ) groups.set( key, { toy, members: [] } );
-			groups.get( key ).members.push( piece );
+			}
 
 		}
 
+		// a post on each corner
+
+		const cornerAngle = angle + Math.PI / 8;
+		const post = new THREE.Mesh( postGeometry, arenaPostMaterial );
+		post.position.set( Math.cos( cornerAngle ) * 6.55, 0.5, Math.sin( cornerAngle ) * 6.55 );
+		post.castShadow = true;
+		group.add( post );
+
 	}
 
-	const bindings = [];
+	scene.add( group );
+
+	return group;
+
+}
+
+// one fighter = one robot in the arena: bodies, joints, hp, ai state
+
+function buildFighter( bot, world, offset, lift, index, rng ) {
+
+	const fighter = {
+		bot,
+		name: bot.name,
+		color: FIGHTER_COLORS[ index % FIGHTER_COLORS.length ],
+		bodies: [],
+		joints: [],
+		states: new Map(),
+		rootPiece: null,
+		rootRec: null,
+		damage: 0,
+		totalHp: 0,
+		wheelsTotal: 0,
+		wheelsAlive: 0,
+		mass: 0,
+		alive: true,
+		status: '',
+		still: 0,
+		slow: 0,
+		hud: null,
+		ai: {
+			style: AI_KEYS[ bot.ai ] ?? 'brawler',
+			rng,
+			jitter: 0,
+			jitterTimer: 0,
+			diveTimer: 2 + rng() * 3,
+			diving: 0,
+			reversing: 0,
+			orbitDir: rng() < 0.5 ? 1 : - 1
+		}
+	};
+
+	for ( const piece of bot.pieces ) {
+
+		const maxHp = pieceMaxHp( piece );
+		fighter.states.set( piece, { hp: maxHp, maxHp, burning: false, burnAcc: 0, smokeAcc: 0, spreadAcc: 0, marks: [] } );
+		fighter.totalHp += maxHp;
+		if ( piece.type === 'wheel' ) fighter.wheelsTotal ++;
+
+	}
+
+	fighter.wheelsAlive = fighter.wheelsTotal;
+	fighter.rootPiece = bot.pieces.find( ( piece ) => piece.parent === null ) ?? bot.pieces[ 0 ];
+
+	// each rigid assembly becomes one body; every spinning piece (plus
+	// anything built onto it) becomes its own body, joined by a motorised
+	// hinge — and every wheel gets a free hinge, so chassis actually roll
+
+	const groups = new Map();
+
+	for ( const piece of bot.pieces ) {
+
+		const key = driveRootOf( piece ) ?? rootPieceOf( piece );
+		if ( ! groups.has( key ) ) groups.set( key, [] );
+		groups.get( key ).push( piece );
+
+	}
+
 	const bodies = new Map();
-	const toyBodies = new Map();
 
-	for ( const [ key, group ] of groups ) {
+	for ( const [ key, members ] of groups ) {
 
-		const offset = offsets.get( group.toy );
 		const origin = new THREE.Vector3();
 
-		if ( key.spin !== 0 ) {
+		if ( key.spin !== 0 || key.type === 'wheel' ) {
 
 			origin.copy( key.position );
 
 		} else {
 
-			for ( const member of group.members ) origin.add( member.position );
-			origin.divideScalar( group.members.length );
+			for ( const member of members ) origin.add( member.position );
+			origin.divideScalar( members.length );
 
 		}
 
@@ -2347,29 +3564,47 @@ function enterPlay() {
 		bodyDef.position = { x: origin.x, y: origin.y, z: origin.z };
 		const body = b3.b3CreateBody( world, bodyDef );
 
-		const rec = { body, origin };
+		const rec = { body, origin, key, live: 0, destroyed: false };
 		bodies.set( key, rec );
+		fighter.bodies.push( rec );
 
-		if ( ! toyBodies.has( group.toy ) ) toyBodies.set( group.toy, [] );
-		toyBodies.get( group.toy ).push( rec );
+		for ( const piece of members ) {
 
-		for ( const piece of group.members ) {
-
-			addCollider( body, piece, origin, lift, offset );
+			const shapeId = addCollider( body, piece, origin, lift, offset );
+			rec.live ++;
 
 			const localPos = piece.position.clone().add( offset );
 			localPos.y += lift;
 			localPos.sub( origin );
 
-			bindings.push( { piece, rec, localPos, localQuat: piece.quaternion.clone() } );
+			const binding = { piece, rec, localPos, localQuat: piece.quaternion.clone(), shapeId, fighter, dead: false };
+			battle.bindings.push( binding );
+			battle.bindingByPiece.set( piece, binding );
+			battle.shapeMap.set( shapeKey( shapeId ), { piece, fighter } );
 
 		}
+
+		// fast weapons tunnel through thin parts without this
+
+		if ( key.spin !== 0 ) b3.b3Body_SetBullet( body, true );
+
+	}
+
+	fighter.rootRec = bodies.get( driveRootOf( fighter.rootPiece ) ?? fighter.rootPiece );
+
+	// a touch of damping steadies chassis that carry spinning mass — but a
+	// bot whose root IS the spinner keeps its freewheel
+
+	if ( fighter.rootRec.key.spin === 0 && fighter.rootRec.key.type !== 'wheel' ) {
+
+		b3.b3Body_SetLinearDamping( fighter.rootRec.body, 0.2 );
+		b3.b3Body_SetAngularDamping( fighter.rootRec.body, 1.2 );
 
 	}
 
 	for ( const [ key, rec ] of bodies ) {
 
-		if ( key.spin === 0 ) continue;
+		if ( key.spin === 0 && key.type !== 'wheel' ) continue;
 
 		const def = TYPES[ key.type ];
 		const axis = def.mountAxis.clone().applyQuaternion( key.quaternion );
@@ -2378,17 +3613,21 @@ function enterPlay() {
 
 			// a lone spinner has nothing to push against — freewheel
 
-			b3.b3Body_SetAngularVelocity( rec.body, {
-				x: axis.x * SPIN_SPEED * key.spin,
-				y: axis.y * SPIN_SPEED * key.spin,
-				z: axis.z * SPIN_SPEED * key.spin
-			} );
+			if ( key.spin !== 0 ) {
+
+				b3.b3Body_SetAngularVelocity( rec.body, {
+					x: axis.x * SPIN_SPEED * key.spin,
+					y: axis.y * SPIN_SPEED * key.spin,
+					z: axis.z * SPIN_SPEED * key.spin
+				} );
+
+			}
 
 			continue;
 
 		}
 
-		const parentRec = bodies.get( spinRootOf( key.parent ) ?? toyRootOf( key.parent ) );
+		const parentRec = bodies.get( driveRootOf( key.parent ) ?? rootPieceOf( key.parent ) );
 
 		_q1.setFromUnitVectors( Z_AXIS, axis );
 		const frameQ = { v: { x: _q1.x, y: _q1.y, z: _q1.z }, s: _q1.w };
@@ -2409,35 +3648,1043 @@ function enterPlay() {
 			q: frameQ
 		};
 		jointDef.base.localFrameB = { p: { x: pivotWorld.x, y: pivotWorld.y, z: pivotWorld.z }, q: frameQ };
-		jointDef.enableMotor = true;
+
+		// motorised for spinners; a plain free hinge for rolling wheels
+
+		jointDef.enableMotor = key.spin !== 0;
 		jointDef.motorSpeed = SPIN_SPEED * key.spin;
 		jointDef.maxMotorTorque = MOTOR_TORQUE;
-		b3.b3CreateRevoluteJoint( world, jointDef );
+
+		const jointId = b3.b3CreateRevoluteJoint( world, jointDef );
+		fighter.joints.push( { id: jointId, key, parentPiece: key.parent, destroyed: false } );
 
 	}
 
-	physics = { world, bindings, bodyList: [ ...bodies.values() ], toyBodies };
+	for ( const rec of fighter.bodies ) fighter.mass += b3.b3Body_GetMass( rec.body );
+
+	return fighter;
+
+}
+
+function enterBattle() {
+
+	// anyone flagged for battle with at least one piece fights
+
+	const roster = robots.filter( ( bot ) => bot.pieces.length > 0 && bot.inBattle );
+
+	const rng = mulberry32( battleSeed );
+
+	// a lone bot gets a house opponent pulled from the samples
+
+	if ( roster.length === 1 ) {
+
+		const sample = SAMPLES[ Math.floor( rng() * SAMPLES.length ) ];
+		const bots = loadRobots( [ sample ] );
+
+		for ( const bot of bots ) {
+
+			bot.temp = true;
+			bot.inBattle = true;
+			roster.push( bot );
+
+		}
+
+		if ( bots.length > 0 ) showToast( `house bot ${ bots[ 0 ].name } enters the arena` );
+
+	}
+
+	const worldDef = b3.b3DefaultWorldDef();
+	worldDef.gravity = { x: 0, y: - 9.81, z: 0 };
+	worldDef.hitEventThreshold = 0.8; // m/s of approach before a hit registers
+	const world = b3.b3CreateWorld( worldDef );
+
+	const groundDef = b3.b3DefaultBodyDef();
+	groundDef.position = { x: 0, y: - 0.51, z: 0 };
+	const groundBody = b3.b3CreateBody( world, groundDef );
+	const groundShape = b3.b3DefaultShapeDef();
+	groundShape.enableHitEvents = true;
+	groundShape.baseMaterial.friction = 0.9;
+	b3.b3CreateBoxShape( groundBody, groundShape, 60, 0.5, 60 ); // safety net under the cup
+
+	const cupDef = b3.b3DefaultBodyDef();
+	const cupBody = b3.b3CreateBody( world, cupDef );
+	b3.b3CreateMeshShape( cupBody, groundShape, groundMesh, { x: 1, y: 1, z: 1 } );
+
+	battle = {
+		world,
+		fighters: [],
+		bindings: [],
+		bindingByPiece: new Map(),
+		shapeMap: new Map(),
+		debris: [],
+		deadQueue: [],
+		markMeshes: [],
+		rng,
+		time: 0,
+		over: false,
+		winner: null,
+		arenaGroup: null
+	};
+
+	battle.arenaGroup = buildArena( world );
+
+	// drop the bots in a seeded ring, a touch above the floor
+
+	let minY = Infinity;
+	for ( const bot of roster ) for ( const piece of bot.pieces ) minY = Math.min( minY, pieceMinY( piece ) );
+	const lift = 0.03 - Math.min( minY, 0.03 );
+
+	const baseAngle = rng() * Math.PI * 2;
+
+	roster.forEach( ( bot, i ) => {
+
+		const angle = baseAngle + ( i / roster.length ) * Math.PI * 2 + ( rng() - 0.5 ) * 0.4;
+		const bounds = botBoundsXZ( bot );
+
+		const offset = new THREE.Vector3(
+			Math.cos( angle ) * 3.2 - ( bounds.minX + bounds.maxX ) / 2,
+			0,
+			Math.sin( angle ) * 3.2 - ( bounds.minZ + bounds.maxZ ) / 2
+		);
+
+		battle.fighters.push( buildFighter( bot, world, offset, lift, i, mulberry32( battleSeed + i * 7919 ) ) );
+
+	} );
+
 	physicsAcc = 0;
+	buildHud();
+	updateBattleBar();
+	document.getElementById( 'banner' ).hidden = true;
 
 }
 
-function resetPlay() {
+// the battle hud — one card per fighter
 
-	if ( physics === null ) return;
+function buildHud() {
 
-	b3.b3DestroyWorld( physics.world );
-	physics = null;
+	const hud = document.getElementById( 'hud' );
+	hud.textContent = '';
 
-	enterPlay();
+	for ( const fighter of battle.fighters ) {
+
+		const card = document.createElement( 'div' );
+		card.className = 'hud-card';
+		card.style.setProperty( '--c', fighter.color );
+		card.addEventListener( 'click', () => { focusBot = fighter.bot; updateBotsList(); } );
+
+		const name = document.createElement( 'div' );
+		name.className = 'hud-name';
+		name.textContent = fighter.name;
+		card.appendChild( name );
+
+		const bar = document.createElement( 'div' );
+		bar.className = 'hud-bar';
+		const fill = document.createElement( 'div' );
+		fill.className = 'hud-fill';
+		bar.appendChild( fill );
+		card.appendChild( bar );
+
+		const status = document.createElement( 'div' );
+		status.className = 'hud-status';
+		card.appendChild( status );
+
+		fighter.hud = { card, fill, status };
+		hud.appendChild( card );
+
+	}
 
 }
 
-function exitPlay() {
+function updateBattleBar() {
 
-	if ( physics === null ) return;
+	document.getElementById( 'battleSeed' ).textContent = `seed ${ battleSeed } ↻`;
 
-	b3.b3DestroyWorld( physics.world );
-	physics = null;
+}
+
+function fighterBurning( fighter ) {
+
+	for ( const state of fighter.states.values() ) {
+
+		if ( state.burning ) return true;
+
+	}
+
+	return false;
+
+}
+
+function updateHudFrame() {
+
+	const remaining = Math.max( BATTLE_TIME - battle.time, 0 );
+	const minutes = Math.floor( remaining / 60 );
+	const seconds = Math.floor( remaining % 60 );
+	document.getElementById( 'battleTime' ).textContent = `${ minutes }:${ String( seconds ).padStart( 2, '0' ) }`;
+
+	for ( const fighter of battle.fighters ) {
+
+		const integrity = Math.max( 0, 1 - fighter.damage / fighter.totalHp );
+		fighter.hud.fill.style.width = `${ integrity * 100 }%`;
+		fighter.hud.card.classList.toggle( 'dead', fighter.alive === false );
+
+		let status = fighter.status;
+
+		if ( fighter.alive && battle.over === false ) {
+
+			if ( fighter.still > 2 ) status = `COUNT-OUT ${ Math.max( Math.ceil( COUNT_OUT - fighter.still ), 0 ) }`;
+			else if ( fighterBurning( fighter ) ) status = 'ON FIRE 🔥';
+			else status = '';
+
+		}
+
+		fighter.hud.status.textContent = status;
+
+	}
+
+}
+
+// the driving ai — no controls, just seeded instinct
+
+function aiStep( fighter, dt ) {
+
+	if ( fighter.alive === false || fighter.rootRec.destroyed ) return;
+
+	const body = fighter.rootRec.body;
+	const p = b3.b3Body_GetPosition( body );
+
+	if ( battle.over ) {
+
+		// victory donuts
+
+		b3.b3Body_ApplyTorque( body, { x: 0, y: fighter.mass * 8, z: 0 }, true );
+		return;
+
+	}
+
+	const ai = fighter.ai;
+	const v = b3.b3Body_GetLinearVelocity( body );
+
+	// how long we've been crawling — pressed into someone, or beached
+
+	fighter.slow = Math.hypot( v.x, v.z ) < 0.25 ? fighter.slow + dt : 0;
+
+	// nearest living enemy
+
+	let tx = 0, tz = 0, best = Infinity;
+
+	for ( const other of battle.fighters ) {
+
+		if ( other === fighter || other.alive === false || other.rootRec.destroyed ) continue;
+
+		const op = b3.b3Body_GetPosition( other.rootRec.body );
+		const d = ( op.x - p.x ) ** 2 + ( op.z - p.z ) ** 2;
+
+		if ( d < best ) { best = d; tx = op.x; tz = op.z; }
+
+	}
+
+	let dirX, dirZ;
+
+	if ( best === Infinity ) {
+
+		dirX = - p.x; dirZ = - p.z; // no one left — drift to centre
+
+	} else {
+
+		const dx = tx - p.x, dz = tz - p.z;
+		const dist = Math.max( Math.hypot( dx, dz ), 1e-4 );
+		const nx = dx / dist, nz = dz / dist;
+
+		ai.diveTimer -= dt;
+
+		if ( ai.style === 'brawler' ) {
+
+			dirX = nx; dirZ = nz;
+
+		} else if ( ai.diving > 0 ) {
+
+			// mid-lunge: straight at them
+
+			ai.diving -= dt;
+			dirX = nx; dirZ = nz;
+
+		} else if ( ai.style === 'orbiter' ) {
+
+			if ( ai.diveTimer <= 0 ) { ai.diving = 1.5; ai.diveTimer = 2 + ai.rng() * 2.5; }
+
+			// circle at arm's length, drifting in or out to hold the radius
+
+			const err = THREE.MathUtils.clamp( dist - 1.9, - 1, 1 );
+			dirX = - nz * ai.orbitDir + nx * err;
+			dirZ = nx * ai.orbitDir + nz * err;
+
+		} else {
+
+			// skirmisher: keep distance, strafe, dart in on a timer
+
+			if ( ai.diveTimer <= 0 ) { ai.diving = 1.5; ai.diveTimer = 2 + ai.rng() * 3; }
+
+			if ( dist < 1.1 ) { dirX = - nx; dirZ = - nz; }
+			else if ( dist > 2.8 ) { dirX = nx; dirZ = nz; }
+			else { dirX = - nz * ai.orbitDir; dirZ = nx * ai.orbitDir; }
+
+		}
+
+	}
+
+	let len = Math.hypot( dirX, dirZ );
+	if ( len < 1e-4 ) { dirX = 1; dirZ = 0; len = 1; }
+	dirX /= len; dirZ /= len;
+
+	// jammed against something? back off, then come in again for the hit —
+	// the ram-reverse-ram rhythm is where the damage comes from
+
+	if ( ai.reversing > 0 ) {
+
+		ai.reversing -= dt;
+		dirX = - dirX; dirZ = - dirZ;
+
+	} else if ( fighter.slow > 1.2 ) {
+
+		ai.reversing = 0.8 + ai.rng() * 0.5;
+
+	}
+
+	// seeded heading jitter — this is why the same bots fight differently
+	// on every seed
+
+	ai.jitterTimer -= dt;
+
+	if ( ai.jitterTimer <= 0 ) {
+
+		ai.jitterTimer = 0.7 + ai.rng() * 1.2;
+		ai.jitter = ( ai.rng() - 0.5 ) * ( ai.style === 'brawler' ? 0.5 : 0.9 );
+
+	}
+
+	const cos = Math.cos( ai.jitter ), sin = Math.sin( ai.jitter );
+	let sx = dirX * cos - dirZ * sin;
+	let sz = dirX * sin + dirZ * cos;
+
+	// steer back inside when the wall looms
+
+	const rad = Math.hypot( p.x, p.z );
+
+	if ( rad > 4.4 ) {
+
+		let w = Math.min( ( rad - 4.4 ) / 1.6, 1 );
+		w *= w;
+		sx = sx * ( 1 - w ) - ( p.x / rad ) * w;
+		sz = sz * ( 1 - w ) - ( p.z / rad ) * w;
+
+		const l = Math.max( Math.hypot( sx, sz ), 1e-4 );
+		sx /= l; sz /= l;
+
+	}
+
+	// a flipped bot claws for grip, mostly in vain — right yourself or be counted out
+
+	const q = b3.b3Body_GetRotation( body );
+	_bq1.set( q.v.x, q.v.y, q.v.z, q.s );
+	const flipped = _bv1.set( 0, 1, 0 ).applyQuaternion( _bq1 ).y < - 0.3;
+
+	// losing wheels slows you; weight drags at the top speed
+
+	// wheel-less bots need a slippery belly (a wedge) to shove themselves
+	// around — a plain wooden brick just sits there
+
+	let scale = fighter.wheelsTotal === 0 ? 0.35 : 0.4 + 0.6 * ( fighter.wheelsAlive / fighter.wheelsTotal );
+	if ( flipped ) scale *= 0.25;
+
+	// wheels only roll one way, so a bot drives like a real robot: twist
+	// the axles toward the target, push along whatever rolls
+
+	let fx = sx, fz = sz; // wheel-less bots just scrape straight at it
+
+	if ( fighter.wheelsAlive > 0 && flipped === false ) {
+
+		let ax = 0, az = 0;
+
+		for ( const piece of fighter.bot.pieces ) {
+
+			if ( piece.type !== 'wheel' || fighter.states.has( piece ) === false ) continue;
+
+			_bv2.set( 0, 0, 1 ).applyQuaternion( piece.mesh.quaternion );
+
+			// axles flip sign side to side — fold them into one direction
+
+			if ( ax * _bv2.x + az * _bv2.z < 0 ) { ax -= _bv2.x; az -= _bv2.z; }
+			else { ax += _bv2.x; az += _bv2.z; }
+
+		}
+
+		const axleLength = Math.hypot( ax, az );
+
+		if ( axleLength > 1e-3 ) {
+
+			ax /= axleLength; az /= axleLength;
+
+			// the rolling direction is ⊥ the axles, signed toward the target
+
+			let rx = - az, rz = ax;
+			if ( rx * sx + rz * sz < 0 ) { rx = - rx; rz = - rz; }
+
+			const align = rx * sx + rz * sz; // cos of the misalignment
+			const steer = rz * sx - rx * sz; // signed sin — which way to twist
+
+			b3.b3Body_ApplyTorque( body, { x: 0, y: fighter.mass * 5 * steer, z: 0 }, true );
+
+			fx = rx; fz = rz;
+			scale *= Math.max( align, 0.2 );
+
+		}
+
+	}
+
+	const maxSpeed = AI_STYLES[ ai.style ].maxSpeed * Math.pow( 45 / ( fighter.mass + 15 ), 0.25 );
+
+	if ( v.x * fx + v.z * fz < maxSpeed ) {
+
+		const force = DRIVE * fighter.mass * scale;
+		b3.b3Body_ApplyForceToCenter( body, { x: fx * force, y: 0, z: fz * force }, true );
+		fighter.dbg = { fx: Math.round( fx * force ), fz: Math.round( fz * force ), scale: Math.round( scale * 100 ) / 100 };
+
+	} else {
+
+		fighter.dbg = { capped: true };
+
+	}
+
+	// reversing didn't free it either — twist loose
+
+	if ( flipped === false && fighter.slow > 2.5 && ai.reversing <= 0 ) {
+
+		b3.b3Body_ApplyTorque( body, { x: 0, y: fighter.mass * 4 * ai.orbitDir, z: 0 }, true );
+
+	}
+
+}
+
+// damage — every contact hit above the threshold hurts whoever got touched,
+// scaled by what touched them and how fast it arrived
+
+function processHits() {
+
+	const count = b3.getNumContactHitEvents( eventsBuffer );
+	let sounds = 0;
+
+	for ( let i = 0; i < count; i ++ ) {
+
+		b3.getContactHitEventAt( hitEvent, eventsBuffer, i );
+
+		const a = battle.shapeMap.get( shapeKey( hitEvent.shapeIdA ) );
+		const b = battle.shapeMap.get( shapeKey( hitEvent.shapeIdB ) );
+		const speed = hitEvent.approachSpeed;
+		const point = hitEvent.point;
+
+		if ( sounds < 3 ) {
+
+			const metal = ( a?.piece !== undefined && a.piece.armor !== 'wood' ) ||
+				( b?.piece !== undefined && b.piece.armor !== 'wood' ) ||
+				a?.hazard === true || b?.hazard === true;
+
+			playHit( point, speed, metal );
+			sounds ++;
+
+		}
+
+		if ( speed < DMG_MIN_SPEED || battle.over ) continue;
+
+		applyHitTo( a, b, speed, point );
+		applyHitTo( b, a, speed, point );
+
+	}
+
+}
+
+function applyHitTo( target, source, speed, point ) {
+
+	if ( target?.piece === undefined || target.fighter.alive === false ) return;
+
+	const state = target.fighter.states.get( target.piece );
+	if ( state === undefined || state.hp <= 0 ) return;
+
+	let amount;
+
+	if ( source?.piece !== undefined ) {
+
+		const def = TYPES[ source.piece.type ];
+		const armor = ARMORS[ source.piece.armor ];
+		const binding = battle.bindingByPiece.get( source.piece );
+		if ( binding === undefined || binding.rec.destroyed ) return;
+
+		// hitting power grows with the mass behind the blow — a spike on a
+		// heavy chassis rams harder than the same spike on a feather
+
+		const heft = Math.cbrt( Math.max( b3.b3Body_GetMass( binding.rec.body ), 1 ) / 12 );
+		const friendly = source.fighter === target.fighter ? 0.4 : 1; // your own flail still stings
+
+		amount = 1.7 * Math.pow( speed - 1.2, 1.5 ) * def.dmg * armor.dmg * heft * friendly;
+
+	} else if ( source?.hazard === true ) {
+
+		amount = 1.7 * Math.pow( speed - 1.2, 1.5 ) * 3;
+
+	} else {
+
+		return; // floors, plain walls and dead debris are harmless
+
+	}
+
+	if ( TYPES[ target.piece.type ].weapon ) amount *= 0.35; // weapons are hardened
+
+	if ( amount < 0.3 ) return;
+
+	damagePiece( target.fighter, target.piece, amount, point );
+
+}
+
+function damagePiece( fighter, piece, amount, point ) {
+
+	const state = fighter.states.get( piece );
+
+	const applied = Math.min( state.hp, amount );
+	state.hp -= applied;
+	fighter.damage += applied;
+
+	_bv1.set( point.x, point.y, point.z );
+	emitSparks( _bv1, Math.min( 2 + Math.floor( amount * 0.8 ), 14 ), piece.armor !== 'wood' );
+
+	if ( amount > 2.5 && state.marks.length < 6 ) addMark( fighter, piece, _bv1, amount );
+
+	// battered wood catches fire
+
+	if ( state.burning === false && ARMORS[ piece.armor ].flammable && state.hp < state.maxHp * 0.65 && battle.rng() < 0.5 ) {
+
+		state.burning = true;
+
+	}
+
+	if ( state.hp <= 0 ) battle.deadQueue.push( { fighter, piece, point: _bv1.clone() } );
+
+}
+
+function addMark( fighter, piece, worldPoint, amount ) {
+
+	const state = fighter.states.get( piece );
+
+	const mark = new THREE.Mesh( markGeometry, markMaterial );
+	const r = Math.min( 0.028 + amount * 0.004, 0.085 );
+	mark.scale.set( r, r * 0.45, r );
+	mark.rotation.set( Math.random() * 3, Math.random() * 3, Math.random() * 3 );
+
+	_bv2.copy( worldPoint );
+	piece.mesh.worldToLocal( _bv2 );
+	mark.position.copy( _bv2 );
+
+	piece.mesh.add( mark );
+	state.marks.push( mark );
+	battle.markMeshes.push( mark );
+
+}
+
+// death of a piece — it and everything bolted to it snaps off as debris
+
+function processDeaths() {
+
+	while ( battle.deadQueue.length > 0 ) {
+
+		const { fighter, piece, point } = battle.deadQueue.shift();
+		if ( fighter.states.has( piece ) === false ) continue; // already scrap
+
+		destroyPieceInBattle( fighter, piece, point );
+
+	}
+
+	battle.bindings = battle.bindings.filter( ( binding ) => binding.dead === false );
+
+}
+
+function destroyPieceInBattle( fighter, piece, point ) {
+
+	if ( piece === fighter.rootPiece ) {
+
+		destroyFighter( fighter );
+		return;
+
+	}
+
+	const doomed = collectSubtree( piece, fighter.bot ).filter( ( p ) => fighter.states.has( p ) );
+	const doomedSet = new Set( doomed );
+
+	// joints anchored to lost pieces die first — a freed spinner keeps
+	// whirling as it flies
+
+	for ( const joint of fighter.joints ) {
+
+		if ( joint.destroyed ) continue;
+
+		if ( doomedSet.has( joint.key ) || doomedSet.has( joint.parentPiece ) ) {
+
+			try { b3.b3DestroyJoint( joint.id ); } catch ( error ) { /* body already gone */ }
+			joint.destroyed = true;
+
+		}
+
+	}
+
+	for ( const p of doomed ) {
+
+		const state = fighter.states.get( p );
+		fighter.damage += Math.max( state.hp, 0 ); // lost parts count as damage
+		fighter.states.delete( p );
+		if ( p.type === 'wheel' ) fighter.wheelsAlive --;
+		breakOffPiece( p, 1.5 );
+
+	}
+
+	for ( const rec of fighter.bodies ) {
+
+		if ( rec.destroyed === false && rec.live <= 0 ) {
+
+			try { b3.b3DestroyBody( rec.body ); } catch ( error ) { /* already gone */ }
+			rec.destroyed = true;
+
+		}
+
+	}
+
+	playCrunch( point );
+	emitExplosion( point, doomed.length > 2 );
+
+}
+
+function breakOffPiece( piece, kick ) {
+
+	const binding = battle.bindingByPiece.get( piece );
+	if ( binding === undefined || binding.dead ) return;
+
+	const mesh = piece.mesh;
+	const rng = battle.rng;
+
+	// the debris keeps the velocity it had as part of the robot
+
+	let vel = { x: 0, y: 0.5, z: 0 };
+
+	if ( binding.rec.destroyed === false ) {
+
+		vel = b3.b3Body_GetWorldPointVelocity( binding.rec.body, { x: mesh.position.x, y: mesh.position.y, z: mesh.position.z } );
+		try { b3.b3DestroyShape( binding.shapeId, true ); } catch ( error ) { /* already gone */ }
+		binding.rec.live --;
+
+	}
+
+	battle.shapeMap.delete( shapeKey( binding.shapeId ) );
+	binding.dead = true;
+	battle.bindingByPiece.delete( piece );
+
+	// a free body at the piece's current pose — the rotation is baked into
+	// the hull so the body itself can stay unrotated
+
+	const bodyDef = b3.b3DefaultBodyDef();
+	bodyDef.type = b3.b3BodyType.b3_dynamicBody;
+	bodyDef.position = { x: mesh.position.x, y: mesh.position.y, z: mesh.position.z };
+	const body = b3.b3CreateBody( battle.world, bodyDef );
+
+	const def = TYPES[ piece.type ];
+	const shapeDef = b3.b3DefaultShapeDef();
+	shapeDef.density = DENSITY * ARMORS[ piece.armor ].density;
+	shapeDef.enableHitEvents = true;
+	shapeDef.baseMaterial.friction = 0.6;
+	shapeDef.baseMaterial.restitution = 0.2;
+
+	let shapeId;
+
+	if ( def.kind === 'sphere' ) {
+
+		shapeId = b3.b3CreateSphereShape( body, shapeDef, { center: { x: 0, y: 0, z: 0 }, radius: piece.size.radius } );
+
+	} else {
+
+		const flat = [];
+
+		for ( const point of colliderLocalPoints( piece ) ) {
+
+			_bv2.copy( point ).applyQuaternion( mesh.quaternion );
+			flat.push( _bv2.x, _bv2.y, _bv2.z );
+
+		}
+
+		const hull = b3.b3CreateHull( flat );
+		shapeId = b3.b3CreateHullShape( body, shapeDef, hull );
+		hull.delete();
+
+	}
+
+	b3.b3Body_SetLinearVelocity( body, {
+		x: vel.x + ( rng() - 0.5 ) * kick * 2,
+		y: vel.y + rng() * kick * 1.5 + 0.5,
+		z: vel.z + ( rng() - 0.5 ) * kick * 2
+	} );
+
+	b3.b3Body_SetAngularVelocity( body, {
+		x: ( rng() - 0.5 ) * 8,
+		y: ( rng() - 0.5 ) * 8,
+		z: ( rng() - 0.5 ) * 8
+	} );
+
+	const rec = { body, origin: mesh.position.clone(), key: null, live: 1, destroyed: false };
+	battle.bindings.push( { piece, rec, localPos: new THREE.Vector3(), localQuat: mesh.quaternion.clone(), shapeId, fighter: null, dead: false } );
+	battle.debris.push( rec );
+
+	// keep the junkyard bounded — the oldest chunk freezes where it lies
+
+	if ( battle.debris.length > 40 ) {
+
+		const old = battle.debris.shift();
+
+		if ( old.destroyed === false ) {
+
+			try { b3.b3DestroyBody( old.body ); } catch ( error ) { /* already gone */ }
+			old.destroyed = true;
+
+		}
+
+	}
+
+}
+
+// chassis destroyed — the whole robot lets go of itself
+
+function destroyFighter( fighter ) {
+
+	fighter.alive = false;
+	fighter.status = 'DESTROYED';
+
+	for ( const joint of fighter.joints ) {
+
+		if ( joint.destroyed ) continue;
+		try { b3.b3DestroyJoint( joint.id ); } catch ( error ) { /* already gone */ }
+		joint.destroyed = true;
+
+	}
+
+	_bv1.copy( fighter.rootPiece.mesh.position );
+
+	for ( const piece of [ ...fighter.states.keys() ] ) {
+
+		const state = fighter.states.get( piece );
+		fighter.damage += Math.max( state.hp, 0 );
+		fighter.states.delete( piece );
+		if ( piece.type === 'wheel' ) fighter.wheelsAlive --;
+		breakOffPiece( piece, 3 );
+
+	}
+
+	for ( const rec of fighter.bodies ) {
+
+		if ( rec.destroyed === false && rec.live <= 0 ) {
+
+			try { b3.b3DestroyBody( rec.body ); } catch ( error ) { /* already gone */ }
+			rec.destroyed = true;
+
+		}
+
+	}
+
+	playCrunch( _bv1 );
+	emitExplosion( _bv1, true );
+	checkOver();
+
+}
+
+// knocked out but still in one piece — power down and smoke
+
+function koFighter( fighter, status ) {
+
+	fighter.alive = false;
+	fighter.status = status;
+
+	for ( const joint of fighter.joints ) {
+
+		if ( joint.destroyed ) continue;
+		try { b3.b3DestroyJoint( joint.id ); } catch ( error ) { /* already gone */ }
+		joint.destroyed = true;
+
+	}
+
+	for ( const rec of fighter.bodies ) {
+
+		if ( rec.destroyed ) continue;
+		b3.b3Body_SetLinearDamping( rec.body, 0.6 );
+		b3.b3Body_SetAngularDamping( rec.body, 0.5 );
+
+	}
+
+	if ( fighter.rootRec.destroyed === false ) {
+
+		const p = b3.b3Body_GetPosition( fighter.rootRec.body );
+
+		for ( let i = 0; i < 6; i ++ ) {
+
+			_bv1.set( p.x + ( Math.random() - 0.5 ) * 0.4, p.y + 0.2, p.z + ( Math.random() - 0.5 ) * 0.4 );
+			emitSmoke( _bv1 );
+
+		}
+
+	}
+
+	checkOver();
+
+}
+
+function pieceRadius( piece ) {
+
+	const size = piece.size;
+	const kind = TYPES[ piece.type ].kind;
+
+	if ( kind === 'box' || kind === 'wedge' ) return Math.max( size.x, size.y, size.z ) / 2;
+	if ( kind === 'cylinder' ) return Math.max( size.radius, size.width / 2 );
+	if ( kind === 'cone' ) return Math.max( size.radius, size.height / 2 );
+
+	return size.radius;
+
+}
+
+// fire — battered wood burns, burns spread along the frame, and a bot
+// can burn its way right up to a knockout
+
+function fireTick( dt ) {
+
+	for ( const fighter of battle.fighters ) {
+
+		for ( const [ piece, state ] of fighter.states ) {
+
+			if ( state.burning === false ) {
+
+				// heavily dented pieces smoulder even without flames
+
+				if ( state.hp < state.maxHp * 0.4 ) {
+
+					state.smokeAcc += dt;
+
+					if ( state.smokeAcc > 0.6 ) {
+
+						state.smokeAcc = 0;
+						_bv1.copy( piece.mesh.position );
+						_bv1.y += pieceRadius( piece ) * 0.5;
+						emitSmoke( _bv1 );
+
+					}
+
+				}
+
+				continue;
+
+			}
+
+			if ( fighter.alive && battle.over === false ) {
+
+				const burn = state.maxHp * FIRE_DPS * dt;
+				const applied = Math.min( state.hp, burn );
+				state.hp -= applied;
+				fighter.damage += applied;
+
+				if ( state.hp <= 0 ) {
+
+					battle.deadQueue.push( { fighter, piece, point: piece.mesh.position.clone() } );
+					continue;
+
+				}
+
+			}
+
+			const radius = pieceRadius( piece );
+
+			state.burnAcc += dt;
+
+			if ( state.burnAcc > 0.07 ) {
+
+				state.burnAcc = 0;
+				_bv1.copy( piece.mesh.position );
+				_bv1.x += ( Math.random() - 0.5 ) * radius;
+				_bv1.y += Math.random() * radius * 0.8;
+				_bv1.z += ( Math.random() - 0.5 ) * radius;
+				emitFlame( _bv1 );
+
+			}
+
+			state.smokeAcc += dt;
+
+			if ( state.smokeAcc > 0.4 ) {
+
+				state.smokeAcc = 0;
+				_bv1.copy( piece.mesh.position );
+				_bv1.y += radius;
+				emitSmoke( _bv1 );
+
+			}
+
+			// flames wander to whatever wood is bolted on
+
+			state.spreadAcc += dt;
+
+			if ( state.spreadAcc > 2 ) {
+
+				state.spreadAcc = 0;
+
+				if ( battle.rng() < 0.3 ) {
+
+					const neighbours = [];
+
+					if ( piece.parent !== null && fighter.states.has( piece.parent ) ) neighbours.push( piece.parent );
+
+					for ( const other of fighter.bot.pieces ) {
+
+						if ( other.parent === piece && fighter.states.has( other ) ) neighbours.push( other );
+
+					}
+
+					for ( const other of neighbours ) {
+
+						const otherState = fighter.states.get( other );
+
+						if ( otherState.burning === false && ARMORS[ other.armor ].flammable ) {
+
+							otherState.burning = true;
+							break;
+
+						}
+
+					}
+
+				}
+
+			}
+
+		}
+
+	}
+
+}
+
+// the ways to die: shaken to bits, burned, counted out, thrown out,
+// or ground down past the damage limit
+
+function statusTick( dt ) {
+
+	if ( battle.over ) return;
+
+	battle.time += dt;
+
+	for ( const fighter of battle.fighters ) {
+
+		if ( fighter.alive === false ) continue;
+
+		if ( fighter.damage >= fighter.totalHp * KO_DAMAGE ) {
+
+			koFighter( fighter, 'KNOCKED OUT' );
+			continue;
+
+		}
+
+		const p = b3.b3Body_GetPosition( fighter.rootRec.body );
+
+		if ( Math.hypot( p.x, p.z ) > ARENA_OUT || p.y < - 0.5 ) {
+
+			koFighter( fighter, 'OUT OF THE ARENA' );
+			continue;
+
+		}
+
+		// controlled movement counts — turning in place is not immobile
+
+		const v = b3.b3Body_GetLinearVelocity( fighter.rootRec.body );
+		const w = b3.b3Body_GetAngularVelocity( fighter.rootRec.body );
+		const moving = Math.hypot( v.x, v.y, v.z ) > 0.15 || Math.hypot( w.x, w.y, w.z ) > 0.4;
+		fighter.still = moving ? 0 : fighter.still + dt;
+
+		if ( fighter.still >= COUNT_OUT ) koFighter( fighter, 'COUNTED OUT' );
+
+	}
+
+	if ( battle.over === false && battle.time >= BATTLE_TIME ) {
+
+		// the judges' decision — least damaged bot takes it
+
+		const alive = battle.fighters.filter( ( fighter ) => fighter.alive );
+		alive.sort( ( a, b ) => a.damage / a.totalHp - b.damage / b.totalHp );
+
+		const margin = alive.length > 1
+			? alive[ 1 ].damage / alive[ 1 ].totalHp - alive[ 0 ].damage / alive[ 0 ].totalHp
+			: 1;
+
+		endBattle( margin < 0.02 ? null : alive[ 0 ], "judges' decision" );
+
+	}
+
+}
+
+function checkOver() {
+
+	if ( battle.over ) return;
+
+	const alive = battle.fighters.filter( ( fighter ) => fighter.alive );
+
+	if ( alive.length === 1 ) endBattle( alive[ 0 ], 'last bot standing' );
+	else if ( alive.length === 0 ) endBattle( null, 'mutual destruction' );
+
+}
+
+function endBattle( winner, how ) {
+
+	battle.over = true;
+	battle.winner = winner;
+
+	if ( winner !== null ) winner.status = '🏆 WINNER';
+
+	document.getElementById( 'bannerTitle' ).textContent = winner !== null ? `${ winner.name.toUpperCase() } WINS!` : "IT'S A DRAW";
+	document.getElementById( 'bannerSub' ).textContent = how;
+	document.getElementById( 'banner' ).hidden = false;
+
+	playHorn();
+
+	if ( winner !== null && winner.rootRec.destroyed === false ) {
+
+		const p = b3.b3Body_GetPosition( winner.rootRec.body );
+		emitConfetti( _bv1.set( p.x, p.y + 0.5, p.z ) );
+
+	} else {
+
+		emitConfetti( _bv1.set( 0, 1, 0 ) );
+
+	}
+
+}
+
+function resetBattle() {
+
+	if ( battle === null ) return;
+
+	teardownBattle();
+	enterBattle();
+	refreshVisibility();
+	updateBotsList();
+
+}
+
+function teardownBattle() {
+
+	if ( battle === null ) return;
+
+	b3.b3DestroyWorld( battle.world );
+
+	for ( const mark of battle.markMeshes ) mark.removeFromParent();
+
+	scene.remove( battle.arenaGroup );
+
+	const geometries = new Set();
+	battle.arenaGroup.traverse( ( child ) => { if ( child.geometry !== undefined ) geometries.add( child.geometry ); } );
+	for ( const geometry of geometries ) geometry.dispose();
 
 	for ( const piece of allPieces() ) {
 
@@ -2446,7 +4693,90 @@ function exitPlay() {
 
 	}
 
-	controls.target.set( 0, 0.4, 0 );
+	clearParticles();
+	document.getElementById( 'hud' ).textContent = '';
+	document.getElementById( 'banner' ).hidden = true;
+
+	battle = null;
+
+}
+
+function setMode( next ) {
+
+	if ( next === mode ) return;
+
+	cancelResize();
+	cancelPivotDrag();
+	cancelMoveDrag();
+	abortRecording();
+
+	if ( next === 'battle' ) {
+
+		const stocked = robots.filter( ( bot ) => bot.pieces.length > 0 );
+
+		if ( stocked.length === 0 ) {
+
+			showToast( 'build a robot first — or grab one from Community' );
+			return;
+
+		}
+
+		// nobody staged? everyone fights
+
+		if ( stocked.filter( ( bot ) => bot.inBattle ).length === 0 ) {
+
+			for ( const bot of stocked ) bot.inBattle = true;
+
+		}
+
+		select( null );
+		initAudio(); // mode switches are user gestures, so this is allowed
+		mode = 'battle';
+		enterBattle();
+
+	} else {
+
+		teardownBattle();
+		mode = 'build';
+
+		// house bots leave with the crowd
+
+		const temps = robots.filter( ( bot ) => bot.temp );
+
+		for ( const bot of temps ) {
+
+			for ( const piece of bot.pieces ) destroyPiece( piece );
+			bot.pieces = [];
+
+		}
+
+		robots = robots.filter( ( bot ) => bot.temp === false );
+
+		if ( robots.length === 0 ) addBot();
+		else if ( robots.includes( activeBot ) === false ) setActiveBot( robots[ 0 ] );
+
+		controls.target.set( 0, 0.4, 0 );
+
+	}
+
+	focusBot = null;
+
+	document.body.classList.toggle( 'battle', mode === 'battle' );
+	document.getElementById( 'buildBtn' ).classList.toggle( 'active', mode === 'build' );
+	document.getElementById( 'battleBtn' ).classList.toggle( 'active', mode === 'battle' );
+
+	refreshVisibility();
+	updateBotsList();
+
+	for ( const piece of allPieces() ) {
+
+		if ( piece.indicator !== null ) piece.indicator.root.visible = mode === 'build';
+
+	}
+
+	updateToolbar();
+	updateHint();
+	updateBotBar();
 
 }
 
@@ -2455,29 +4785,29 @@ function animate() {
 	timer.update();
 	const delta = Math.min( timer.getDelta(), 0.1 );
 
-	if ( physics !== null ) {
+	if ( battle !== null ) {
 
 		physicsAcc += delta;
 
 		while ( physicsAcc >= TIME_STEP ) {
 
-			b3.b3World_Step( physics.world, TIME_STEP, 4 );
+			for ( const fighter of battle.fighters ) aiStep( fighter, TIME_STEP );
+
+			b3.b3World_Step( battle.world, TIME_STEP, 4 );
 			physicsAcc -= TIME_STEP;
 
-			b3.getEvents( eventsBuffer, physics.world );
+			b3.getEvents( eventsBuffer, battle.world );
 
-			const knocks = Math.min( b3.getNumContactHitEvents( eventsBuffer ), 4 );
-
-			for ( let i = 0; i < knocks; i ++ ) {
-
-				b3.getContactHitEventAt( hitEvent, eventsBuffer, i );
-				playKnock( hitEvent.point, hitEvent.approachSpeed );
-
-			}
+			processHits();
+			processDeaths();
+			fireTick( TIME_STEP );
+			statusTick( TIME_STEP );
 
 		}
 
-		for ( const binding of physics.bindings ) {
+		for ( const binding of battle.bindings ) {
+
+			if ( binding.rec.destroyed ) continue;
 
 			const p = b3.b3Body_GetPosition( binding.rec.body );
 			const q = b3.b3Body_GetRotation( binding.rec.body );
@@ -2490,13 +4820,31 @@ function animate() {
 
 		}
 
-		const followed = focusToy !== null && physics.toyBodies.has( focusToy )
-			? physics.toyBodies.get( focusToy )
-			: physics.bodyList;
+		// keep the camera on the centre of the action
+
+		const followed = [];
+		const focusFighter = focusBot !== null ? battle.fighters.find( ( fighter ) => fighter.bot === focusBot ) : undefined;
+
+		if ( focusFighter !== undefined ) {
+
+			for ( const rec of focusFighter.bodies ) if ( rec.destroyed === false ) followed.push( rec );
+
+		}
+
+		if ( followed.length === 0 ) {
+
+			const anyAlive = battle.fighters.some( ( fighter ) => fighter.alive );
+
+			for ( const fighter of battle.fighters ) {
+
+				if ( anyAlive && fighter.alive === false ) continue;
+				for ( const rec of fighter.bodies ) if ( rec.destroyed === false ) followed.push( rec );
+
+			}
+
+		}
 
 		if ( followed.length > 0 ) {
-
-			// keep the camera on the centre of action
 
 			_v2.set( 0, 0, 0 );
 
@@ -2513,9 +4861,11 @@ function animate() {
 
 		}
 
-	} else if ( activeToy !== null ) {
+		updateHudFrame();
 
-		for ( const piece of activeToy.pieces ) {
+	} else if ( activeBot !== null ) {
+
+		for ( const piece of activeBot.pieces ) {
 
 			if ( piece.indicator !== null ) piece.indicator.pivot.rotation.z += piece.spin * 3.5 * delta;
 
@@ -2523,6 +4873,7 @@ function animate() {
 
 	}
 
+	updateParticles( delta );
 	controls.update();
 	postProcessing.render();
 

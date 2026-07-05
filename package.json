@@ -1,0 +1,14 @@
+{
+	"name": "clanker-wars",
+	"version": "1.0.0",
+	"private": true,
+	"type": "module",
+	"description": "Clanker Wars — build wacky battle bots, pick armour and weapons, let them fight. Fork of mrdoob/toys.",
+	"scripts": {
+		"dev": "vercel dev",
+		"serve": "npx serve ."
+	},
+	"dependencies": {
+		"@vercel/postgres": "^0.10.0"
+	}
+}
