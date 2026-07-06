@@ -10,9 +10,6 @@ import { fxaa } from 'three/addons/tsl/display/FXAANode.js';
 import Box3D from 'box3d.js/inline';
 import { createMP4 } from './mp4.js';
 import { makeSamples } from './samples.js';
-import { inject } from '@vercel/analytics';
-
-inject();
 
 const SPIN_SPEED = 13; // rad/s — a 1.7 m bar swings its tips at ~11 m/s
 const MOTOR_TORQUE = 220;
