@@ -9,7 +9,6 @@
 		"serve": "npx serve ."
 	},
 	"dependencies": {
-		"@vercel/analytics": "^2.0.1",
 		"@vercel/postgres": "^0.10.0"
 	}
 }
