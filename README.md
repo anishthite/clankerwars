@@ -36,3 +36,9 @@ Local dev: `vercel dev` (with the database env pulled via `vercel env pull`), or
 - [box3d.js](https://github.com/isaac-mason/box3d.js) — physics: every rigid assembly is one body, every spinner a motorised hinge; parts that break off become debris bodies mid-fight
 - WebCodecs and the three.js editor's MP4 muxer — video export
 - `@vercel/postgres` — the community garage
+
+## Architecture
+
+For a full system diagram and an explanation of the browser runtime, robot
+format, battle simulation, recording pipeline, and optional Community API, see
+[the architecture guide](docs/architecture.md).
